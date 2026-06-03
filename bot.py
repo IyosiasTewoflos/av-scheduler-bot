@@ -38,6 +38,9 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = set(map(int, os.getenv("ADMIN_IDS", "0").split(",")))
 
+# Global bot instance for sending notifications
+bot_instance: Bot = None
+
 if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
     logger.error("❌ BOT_TOKEN not set! Add it to your .env file.")
     exit(1)
@@ -137,6 +140,30 @@ assignments_db: dict = {  # Current assignments for Saturday
     'audio': None,
     'video': None,
 }
+
+# ── Notification Helper Functions ──────────────────────────────────────────────
+async def notify_user(telegram_id: int, text: str, parse_mode: str = ParseMode.MARKDOWN) -> bool:
+    """Send a notification message to a user. Returns True if successful."""
+    if not bot_instance:
+        logger.warning(f"Bot instance not available for notification to {telegram_id}")
+        return False
+    try:
+        await bot_instance.send_message(telegram_id, text, parse_mode=parse_mode)
+        logger.info(f"Notification sent to {telegram_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to send notification to {telegram_id}: {e}")
+        return False
+
+async def notify_all_admins(text: str, parse_mode: str = ParseMode.MARKDOWN) -> None:
+    """Send a notification to all admin users."""
+    for admin_id in ADMIN_IDS:
+        await notify_user(admin_id, text, parse_mode)
+
+async def notify_all_brothers(text: str, parse_mode: str = ParseMode.MARKDOWN) -> None:
+    """Send a notification to all registered brothers."""
+    for telegram_id in brothers_db.keys():
+        await notify_user(telegram_id, text, parse_mode)
 
 # ── Router ────────────────────────────────────────────────────────────────────
 router = Router()
@@ -802,21 +829,46 @@ async def sched_confirm(callback: CallbackQuery, state: FSMContext):
     
     d = await state.get_data()
     role = d.get("role")
-    brother = d.get("chosen_brother")
+    brother_id = d.get("chosen_brother")
     
     # Update assignment
     if role in ["stage", "audio", "video"]:
-        assignments_db[role] = brother
+        assignments_db[role] = brother_id
     elif role == "microphone":
-        if brother:
-            assignments_db["microphone"] = [brother] if brother not in assignments_db["microphone"] else assignments_db["microphone"]
+        if brother_id:
+            assignments_db["microphone"] = [brother_id] if brother_id not in assignments_db["microphone"] else assignments_db["microphone"]
     
-    assigned_text = brother or "None"
+    # Get brother name for display
+    brother_name = "None"
+    if brother_id and brother_id in brothers_db:
+        brother_name = brothers_db[brother_id]['full_name']
+    
     await callback.message.answer(
-        f"✅ *{role.title()}* assigned to *{assigned_text}*!\n\nSchedule updated.",
+        f"✅ *{role.title()}* assigned to *{brother_name}*!\n\nNotification sent.",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=admin_menu(),
     )
+    
+    # Send notification to assigned brother
+    if brother_id and brother_id in brothers_db:
+        today = date.today()
+        saturday = today + timedelta(days=(5 - today.weekday()) % 7)
+        notification = (
+            f"📢 *Schedule Update*\n\n"
+            f"You have been assigned to:\n"
+            f"🎯 *Role*: {role.title()}\n"
+            f"📅 *Date*: {saturday.strftime('%A, %B %d, %Y')}\n"
+            f"⏰ *Time*: 3:00 PM\n\n"
+            f"Please confirm your availability using the buttons below."
+        )
+        kb = assign_kb(f"{brother_id}_{role}")
+        if bot_instance:
+            try:
+                await bot_instance.send_message(brother_id, notification, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+                logger.info(f"Schedule notification sent to {brother_name} ({brother_id}) for {role}")
+            except Exception as e:
+                logger.error(f"Failed to send schedule notification to {brother_id}: {e}")
+    
     await state.clear()
     await callback.answer()
 
@@ -878,6 +930,22 @@ async def pending_approve(callback: CallbackQuery, state: FSMContext):
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=admin_menu(),
     )
+    
+    # Send approval notification to the brother
+    approval_msg = (
+        f"🎉 *Registration Approved!*\n\n"
+        f"Welcome, *{brother['full_name']}*!\n\n"
+        f"Your registration with the A/V Department has been approved. "
+        f"You can now use the /myassignments command to view your assignments and "
+        f"the /availability command to set your availability.\n\n"
+        f"Thank you for serving! 🙏"
+    )
+    if bot_instance:
+        try:
+            await bot_instance.send_message(telegram_id, approval_msg, parse_mode=ParseMode.MARKDOWN, reply_markup=brother_menu())
+            logger.info(f"Approval notification sent to {brother['full_name']} ({telegram_id})")
+        except Exception as e:
+            logger.error(f"Failed to send approval notification to {telegram_id}: {e}")
     
     if pending_approvals:
         brother = pending_approvals[0]
@@ -993,19 +1061,81 @@ async def cmd_send_reminders(message: Message):
     if not is_admin(message.from_user.id):
         await message.answer("❌ This command is for admins only.")
         return
+    
+    if not bot_instance:
+        await message.answer("❌ Bot not ready. Try again in a moment.")
+        return
+    
     today = date.today()
     saturday = today + timedelta(days=(5 - today.weekday()) % 7)
-    text = (
-        f"🔔 *Reminders Sent!*\n\n"
-        f"Program: Saturday {saturday.strftime('%B %d')} at 3:00 PM\n\n"
-        f"Notified:\n"
-        f"• Elias K. (Stage)\n"
-        f"• Samuel M. (Audio)\n"
-        f"• Daniel T. (Microphone)\n"
-        f"• John N. (Microphone)\n"
-        f"• Ruth B. (Video)"
+    
+    # Get assigned brothers
+    assigned = []
+    roles = {
+        'stage': assignments_db.get('stage'),
+        'microphone': assignments_db.get('microphone', []),
+        'audio': assignments_db.get('audio'),
+        'video': assignments_db.get('video'),
+    }
+    
+    reminder_text = (
+        f"🔔 *Service Reminder*\n\n"
+        f"📅 *Date*: {saturday.strftime('%A, %B %d, %Y')}\n"
+        f"⏰ *Time*: 3:00 PM\n\n"
+        f"You have been assigned a role in this week's service. "
+        f"Please confirm your attendance or let us know if you cannot make it.\n\n"
+        f"Use /myassignments to view your assignments."
     )
-    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
+    
+    notified_count = 0
+    notified_names = []
+    
+    # Send reminders to assigned brothers
+    for role, brother_id in roles.items():
+        if brother_id and isinstance(brother_id, int) and brother_id in brothers_db:
+            brother_name = brothers_db[brother_id]['full_name']
+            if brother_id not in [n[0] for n in notified_names]:  # Avoid duplicates if assigned to multiple roles
+                try:
+                    await bot_instance.send_message(
+                        brother_id,
+                        reminder_text,
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                    notified_count += 1
+                    notified_names.append((brother_id, brother_name))
+                    logger.info(f"Reminder sent to {brother_name} ({brother_id}) for {role}")
+                except Exception as e:
+                    logger.error(f"Failed to send reminder to {brother_id}: {e}")
+        elif brother_id and isinstance(brother_id, list):  # For microphone list
+            for mic_id in brother_id:
+                if mic_id in brothers_db and mic_id not in [n[0] for n in notified_names]:
+                    brother_name = brothers_db[mic_id]['full_name']
+                    try:
+                        await bot_instance.send_message(
+                            mic_id,
+                            reminder_text,
+                            parse_mode=ParseMode.MARKDOWN,
+                        )
+                        notified_count += 1
+                        notified_names.append((mic_id, brother_name))
+                        logger.info(f"Reminder sent to {brother_name} ({mic_id}) for microphone")
+                    except Exception as e:
+                        logger.error(f"Failed to send reminder to {mic_id}: {e}")
+    
+    # Send confirmation to admin
+    if notified_names:
+        names_text = "\n".join([f"• {name} ({role.title()})" if role else f"• {name}" for _, name in notified_names for role, brother_id in roles.items() if isinstance(brother_id, int) and brother_id == _ or (isinstance(brother_id, list) and _ in brother_id)])
+        result_text = (
+            f"🔔 *Reminders Sent!*\n\n"
+            f"Program: Saturday {saturday.strftime('%B %d')} at 3:00 PM\n\n"
+            f"Notified ({notified_count}):\n"
+        )
+        for _, name in notified_names:
+            result_text += f"• {name}\n"
+    else:
+        result_text = f"⚠️ *No reminders sent* — No assignments for {saturday.strftime('%B %d')}"
+    
+    await message.answer(result_text, parse_mode=ParseMode.MARKDOWN)
 
 # ── Callbacks ──────────────────────────────────────────────────────────────────
 @router.callback_query(F.data == "approve_schedule")
@@ -1043,20 +1173,42 @@ async def cb_regen(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("confirm_"))
 async def cb_confirm(callback: CallbackQuery):
+    assignment_id = callback.data[8:]  # Extract assignment_id
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer(
         "✅ *Confirmed!*\n\nThank you! See you at the program. We will send a reminder 24 hours before. 🙏",
         parse_mode=ParseMode.MARKDOWN,
     )
+    
+    # Notify admins about confirmation
+    if bot_instance:
+        try:
+            user_name = callback.from_user.first_name
+            confirm_msg = f"✅ *Assignment Confirmed*\n\n{user_name} has confirmed their assignment.\nAssignment ID: {assignment_id}"
+            await notify_all_admins(confirm_msg)
+        except Exception as e:
+            logger.error(f"Failed to notify admins of confirmation: {e}")
+    
     await callback.answer("Confirmed ✅")
 
 @router.callback_query(F.data.startswith("decline_"))
 async def cb_decline(callback: CallbackQuery):
+    assignment_id = callback.data[8:]  # Extract assignment_id
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer(
         "❌ *Noted.*\n\nYour absence has been recorded. Admin will arrange a replacement. Thank you for letting us know!",
         parse_mode=ParseMode.MARKDOWN,
     )
+    
+    # Notify admins about declination
+    if bot_instance:
+        try:
+            user_name = callback.from_user.first_name
+            decline_msg = f"❌ *Assignment Declined*\n\n{user_name} cannot make the assignment.\nAssignment ID: {assignment_id}\n\nPlease arrange a replacement."
+            await notify_all_admins(decline_msg)
+        except Exception as e:
+            logger.error(f"Failed to notify admins of declination: {e}")
+    
     await callback.answer()
 
 @router.callback_query(F.data.startswith("avail_"))
@@ -1070,6 +1222,7 @@ async def cb_avail(callback: CallbackQuery):
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 async def main():
+    global bot_instance
     import ssl
     import certifi
     from aiohttp import TCPConnector
@@ -1082,6 +1235,7 @@ async def main():
     session._connector = connector
 
     bot = Bot(token=BOT_TOKEN, session=session)
+    bot_instance = bot  # Set global instance for notifications
     dp  = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     logger.info("✅ AV Department Bot is starting...")
