@@ -58,14 +58,20 @@ class DeleteBrother(StatesGroup):
     choosing_brother = State()
     confirm_delete = State()
 
+class EditBrother(StatesGroup):
+    choosing_brother = State()
+    choosing_field = State()
+    editing_value = State()
+    confirm_edit = State()
+
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 def admin_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📋 View Schedule"),   KeyboardButton(text="⚡ Auto-Schedule")],
             [KeyboardButton(text="👥 Brother List"),    KeyboardButton(text="➕ Register Brother")],
-            [KeyboardButton(text="�️ Delete Brother"),   KeyboardButton(text="📊 Report")],
-            [KeyboardButton(text="🔔 Send Reminders")],
+            [KeyboardButton(text="✏️ Edit Brother"),     KeyboardButton(text="🗑️ Delete Brother")],
+            [KeyboardButton(text="📊 Report"),           KeyboardButton(text="🔔 Send Reminders")],
         ],
         resize_keyboard=True,
     )
@@ -142,9 +148,10 @@ async def cmd_help(message: Message):
         "*Available Commands:*\n\n"
         "👮 *Admin Only:*\n"
         "/registerbrother — Register a new brother\n"
+        "/editbrother — Edit a brother's info\n"
+        "/deletebrother — Delete a brother\n"
         "/autoschedule — Auto-generate assignments\n"
         "/brotherlist — List all brothers\n"
-        "/deletebrother — Delete a brother\n"
         "/sendreminders — Send reminders\n"
         "/report — Monthly report\n\n"
         "👤 *Everyone:*\n"
@@ -350,6 +357,213 @@ async def cmd_brother_list(message: Message):
     
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
+# ── Edit Brother ───────────────────────────────────────────────────────────────
+@router.message(Command("editbrother"))
+@router.message(F.text == "✏️ Edit Brother")
+async def cmd_edit_start(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ This command is for admins only.")
+        return
+    
+    if not brothers_db:
+        await message.answer("❌ No brothers registered to edit.", reply_markup=admin_menu())
+        return
+    
+    await state.set_state(EditBrother.choosing_brother)
+    # Create inline keyboard with registered brother options
+    kb_buttons = [
+        [InlineKeyboardButton(text=f"✏️ {name}", callback_data=f"edit_{i}")]
+        for i, name in enumerate(brothers_db.keys())
+    ]
+    kb_buttons.append([InlineKeyboardButton(text="❌ Cancel", callback_data="edit_cancel")])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
+    
+    await message.answer(
+        "✏️ *Edit Brother*\n\nSelect a brother to edit:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb,
+    )
+
+@router.callback_query(F.data.startswith("edit_"), EditBrother.choosing_brother)
+async def edit_select_brother(callback: CallbackQuery, state: FSMContext):
+    if callback.data == "edit_cancel":
+        await state.clear()
+        await callback.message.answer("❌ Edit cancelled.", reply_markup=admin_menu())
+        await callback.answer()
+        return
+    
+    # Get brother name from index
+    try:
+        idx = int(callback.data[5:])
+        brother_name = list(brothers_db.keys())[idx]
+    except (ValueError, IndexError):
+        await callback.answer("❌ Invalid selection", show_alert=True)
+        return
+    
+    await state.update_data(brother_name=brother_name)
+    await state.set_state(EditBrother.choosing_field)
+    
+    # Show options for what to edit
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎯 Skills", callback_data="edit_field_skills")],
+        [InlineKeyboardButton(text="📅 Availability", callback_data="edit_field_availability")],
+        [InlineKeyboardButton(text="📱 Phone", callback_data="edit_field_phone")],
+        [InlineKeyboardButton(text="👤 Telegram Username", callback_data="edit_field_username")],
+        [InlineKeyboardButton(text="❌ Cancel", callback_data="edit_cancel")],
+    ])
+    
+    await callback.message.answer(
+        f"✏️ *Edit {brother_name}*\n\nWhat would you like to edit?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb,
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("edit_field_"), EditBrother.choosing_field)
+async def edit_choose_field(callback: CallbackQuery, state: FSMContext):
+    if callback.data == "edit_cancel":
+        await state.clear()
+        await callback.message.answer("❌ Edit cancelled.", reply_markup=admin_menu())
+        await callback.answer()
+        return
+    
+    field = callback.data[11:]
+    d = await state.get_data()
+    brother_name = d.get("brother_name")
+    brother = brothers_db.get(brother_name, {})
+    
+    await state.update_data(editing_field=field)
+    await state.set_state(EditBrother.editing_value)
+    
+    if field == "skills":
+        await callback.message.answer(
+            "🎯 *Edit Skills*\n\nSelect skills (tap all that apply, then Done):",
+            reply_markup=skills_kb(),
+        )
+    elif field == "availability":
+        await callback.message.answer(
+            "📅 *Edit Availability*\n\nSelect days (tap to toggle, then Save):",
+            reply_markup=avail_kb(),
+        )
+    elif field == "phone":
+        current = brother.get('phone') or 'None'
+        await callback.message.answer(
+            f"📱 *Edit Phone*\n\nCurrent: {current}\n\nEnter new phone number or type *skip*:",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    elif field == "username":
+        current = brother.get('telegram_username') or 'None'
+        await callback.message.answer(
+            f"👤 *Edit Telegram Username*\n\nCurrent: {current}\n\nEnter new username (e.g. @username) or type *skip*:",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("skill_"), EditBrother.editing_value)
+async def edit_skill(callback: CallbackQuery, state: FSMContext):
+    if callback.data == "skill_done":
+        d = await state.get_data()
+        if not d.get("skills"):
+            await callback.answer("⚠️ Please select at least one skill!", show_alert=True)
+            return
+        await state.set_state(EditBrother.confirm_edit)
+        brother_name = d.get("brother_name")
+        await callback.message.answer(
+            f"✅ Skills: *{', '.join(d['skills'])}*\n\n📋 *Confirm changes for {brother_name}?*",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=confirm_kb("edit_confirm"),
+        )
+        await callback.answer()
+        return
+    
+    skill = callback.data[6:]
+    d = await state.get_data()
+    skills = d.get("skills", [])
+    if skill in skills:
+        skills.remove(skill)
+    else:
+        skills.append(skill)
+    await state.update_data(skills=skills)
+    await callback.answer(f"Selected: {', '.join(skills) or 'none'}")
+
+@router.callback_query(F.data.startswith("av_"), EditBrother.editing_value)
+async def edit_avail(callback: CallbackQuery, state: FSMContext):
+    day = callback.data[3:]
+    if day == "done":
+        d = await state.get_data()
+        avail = d.get("availability", ["saturday"])
+        await state.set_state(EditBrother.confirm_edit)
+        brother_name = d.get("brother_name")
+        await callback.message.answer(
+            f"✅ Availability: *{', '.join(avail)}*\n\n📋 *Confirm changes for {brother_name}?*",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=confirm_kb("edit_confirm"),
+        )
+        await callback.answer()
+        return
+    
+    d = await state.get_data()
+    avail = d.get("availability", [])
+    if day in avail:
+        avail.remove(day)
+    else:
+        avail.append(day)
+    await state.update_data(availability=avail)
+    await callback.answer(f"Days: {', '.join(avail) or 'none'}")
+
+@router.message(EditBrother.editing_value)
+async def edit_text_field(message: Message, state: FSMContext):
+    d = await state.get_data()
+    field = d.get("editing_field")
+    
+    if field == "phone":
+        v = message.text.strip()
+        await state.update_data(phone=None if v.lower() == "skip" else v)
+    elif field == "username":
+        v = message.text.strip()
+        await state.update_data(telegram_username=None if v.lower() == "skip" else v)
+    
+    await state.set_state(EditBrother.confirm_edit)
+    brother_name = d.get("brother_name")
+    new_val = message.text.strip() if message.text.strip().lower() != "skip" else "—"
+    await message.answer(
+        f"✅ {field.title()}: *{new_val}*\n\n📋 *Confirm changes for {brother_name}?*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=confirm_kb("edit_confirm"),
+    )
+
+@router.callback_query(F.data.startswith("edit_confirm_"), EditBrother.confirm_edit)
+async def edit_confirm(callback: CallbackQuery, state: FSMContext):
+    if callback.data == "edit_confirm_no":
+        await state.clear()
+        await callback.message.answer("❌ Edit cancelled.", reply_markup=admin_menu())
+        await callback.answer()
+        return
+    
+    d = await state.get_data()
+    brother_name = d.get("brother_name")
+    field = d.get("editing_field")
+    
+    # Update the brother record
+    if brother_name in brothers_db:
+        if field == "skills":
+            brothers_db[brother_name]['skills'] = d.get('skills', [])
+        elif field == "availability":
+            brothers_db[brother_name]['availability'] = d.get('availability', ["saturday"])
+        elif field == "phone":
+            brothers_db[brother_name]['phone'] = d.get('phone')
+        elif field == "username":
+            brothers_db[brother_name]['telegram_username'] = d.get('telegram_username')
+    
+    await callback.message.answer(
+        f"✅ *{brother_name}* has been updated successfully!",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=admin_menu(),
+    )
+    await state.clear()
+    await callback.answer()
+
 # ── Delete Brother ─────────────────────────────────────────────────────────────
 @router.message(Command("deletebrother"))
 @router.message(F.text == "🗑️ Delete Brother")
@@ -377,12 +591,16 @@ async def cmd_delete_start(message: Message, state: FSMContext):
         reply_markup=kb,
     )
 
-@router.callback_query(F.data.startswith("del_"), DeleteBrother.choosing_brother)
+@router.callback_query((F.data.startswith("del_") & ~F.data.startswith("del_confirm_")) & ~F.data.in_(["del_cancel"]), DeleteBrother.choosing_brother)
 async def del_select_brother(callback: CallbackQuery, state: FSMContext):
     if callback.data == "del_cancel":
         await state.clear()
         await callback.message.answer("❌ Deletion cancelled.", reply_markup=admin_menu())
         await callback.answer()
+        return
+    
+    # Only handle non-confirm callbacks here
+    if "confirm" in callback.data:
         return
     
     # Get brother name from index
