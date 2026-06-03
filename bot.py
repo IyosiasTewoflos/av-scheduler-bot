@@ -117,18 +117,43 @@ router = Router()
 # /start
 @router.message(CommandStart())
 async def cmd_start(message: Message):
-    name = message.from_user.first_name
-    if is_admin(message.from_user.id):
+    name  = message.from_user.first_name
+    uid   = message.from_user.id
+    uname = message.from_user.username  # may be None
+
+    if is_admin(uid):
         await message.answer(
             f"👋 Welcome, *{name}*!\n\nYou have *Admin* access to the A/V Scheduling System.\nUse the menu below.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=admin_menu(),
         )
-    else:
+        return
+
+    # Try to link this Telegram account to a registered brother.
+    # Match by @username first, then by first name as a fallback.
+    matched = None
+    for b in brothers_db.values():
+        tg = (b.get("telegram_username") or "").lstrip("@").lower()
+        if uname and tg and tg == uname.lower():
+            matched = b
+            break
+    if not matched:
+        for b in brothers_db.values():
+            if b["full_name"].split()[0].lower() == name.lower():
+                matched = b
+                break
+
+    if matched:
+        matched["telegram_id"] = uid
         await message.answer(
-            f"👋 Welcome, *{name}*!\n\nYou are registered with the Audio & Video Department.\nUse the menu to view your assignments.",
+            f"👋 Welcome, *{matched['full_name']}*!\n\nYou are registered with the Audio & Video Department.\nUse the menu to view your assignments.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=brother_menu(),
+        )
+    else:
+        await message.answer(
+            f"👋 Hi *{name}*!\n\nYou are not yet registered in the A/V Department system.\nPlease ask an admin to register you.",
+            parse_mode=ParseMode.MARKDOWN,
         )
 
 # /help
@@ -538,25 +563,53 @@ async def cb_approve(callback: CallbackQuery):
 async def cb_save(callback: CallbackQuery):
     schedule = schedules_db.get("latest")
     if not schedule:
-        await callback.answer("⚠️ No schedule to save.", show_alert=True)
+        await callback.answer("No schedule to save.", show_alert=True)
         return
 
-    # Increment serve count for each assigned brother
-    for names in schedule["assignments"].values():
+    icon_map = {"stage": "🎭", "microphone": "🎤", "audio": "🔊", "video": "🎥"}
+    notified = []
+    failed = []
+
+    for section, names in schedule["assignments"].items():
         for name in names:
             if name in brothers_db:
                 brothers_db[name]["serves"] += 1
 
-    icons = {"stage": "🎭", "microphone": "🎤", "audio": "🔊", "video": "🎥"}
-    lines = []
-    for section, names in schedule["assignments"].items():
-        for name in names:
-            lines.append(f"• {name} ({icons.get(section, '')} {section.capitalize()})")
+            b = brothers_db.get(name)
+            tid = b.get("telegram_id") if b else None
+            section_label = icon_map.get(section, "") + " " + section.capitalize()
+
+            if tid:
+                try:
+                    msg_parts = [
+                        "📢 *You have been assigned!*",
+                        "",
+                        "📅 " + schedule["date"] + " at 3:00 PM",
+                        "🎯 Your section: *" + section_label + "*",
+                        "",
+                        "Please confirm your attendance below.",
+                    ]
+                    await callback.bot.send_message(
+                        chat_id=tid,
+                        text=chr(10).join(msg_parts),
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=assign_kb(name + "_" + section),
+                    )
+                    notified.append("✅ " + name + " (" + section_label + ")")
+                except Exception as e:
+                    logger.warning("Failed to notify %s: %s", name, e)
+                    failed.append("⚠️ " + name + " — delivery failed")
+            else:
+                failed.append("⚠️ " + name + " — no Telegram ID (hasn't started the bot yet)")
+
+    all_results = notified + failed
+    sep = chr(10)
+    summary = sep.join(all_results) if all_results else "_(no brothers assigned)_"
+    header = "💾 *Schedule Saved!*" + chr(10) + chr(10) + "*Notification Results:*" + chr(10)
 
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer(
-        f"💾 *Schedule Saved & Notifications Sent!*\n\n"
-        f"Brothers notified:\n" + ("\n".join(lines) if lines else "_(none)_"),
+        header + summary,
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=admin_menu(),
     )
