@@ -48,10 +48,7 @@ if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
 # ── FSM States ───────────────────────────────────────────────────────────────
 class RegisterBrother(StatesGroup):
     full_name    = State()
-    username     = State()
     phone        = State()
-    skills       = State()
-    availability = State()
     confirm      = State()
 
 class AutoScheduleFlow(StatesGroup):
@@ -204,7 +201,7 @@ async def start_registration(callback: CallbackQuery, state: FSMContext):
     await state.update_data(telegram_id=telegram_id)
     await state.set_state(RegisterBrother.full_name)
     await callback.message.answer(
-        "📝 *Self Registration*\n\nStep 1/5 — Enter your full name:",
+        "📝 *Self Registration*\n\nStep 1/2 — Enter your full name:",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=ReplyKeyboardRemove(),
     )
@@ -241,84 +238,30 @@ async def reg_start(message: Message, state: FSMContext):
         return
     await state.set_state(RegisterBrother.full_name)
     await message.answer(
-        "📝 *Register New Brother*\n\nStep 1/5 — Enter their full name:",
+        "📝 *Register New Brother*\n\nStep 1/2 — Enter their full name:",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=ReplyKeyboardRemove(),
     )
 
 @router.message(RegisterBrother.full_name)
 async def reg_name(message: Message, state: FSMContext):
-    await state.update_data(full_name=message.text.strip(), skills=[], availability=["saturday"])
-    await state.set_state(RegisterBrother.username)
-    await message.answer("Step 2/5 — Telegram username (e.g. @username) or type *skip*:", parse_mode=ParseMode.MARKDOWN)
-
-@router.message(RegisterBrother.username)
-async def reg_username(message: Message, state: FSMContext):
-    v = message.text.strip()
-    await state.update_data(telegram_username=None if v.lower() == "skip" else v)
+    await state.update_data(full_name=message.text.strip())
     await state.set_state(RegisterBrother.phone)
-    await message.answer("Step 3/5 — Phone number (e.g. +251911000001) or type *skip*:", parse_mode=ParseMode.MARKDOWN)
+    await message.answer("Step 2/2 — Phone number (e.g. +251911000001) or type *skip*:", parse_mode=ParseMode.MARKDOWN)
 
 @router.message(RegisterBrother.phone)
 async def reg_phone(message: Message, state: FSMContext):
     v = message.text.strip()
     await state.update_data(phone=None if v.lower() == "skip" else v)
-    await state.set_state(RegisterBrother.skills)
-    await message.answer("Step 4/5 — Select their skills (tap all that apply, then Done):", reply_markup=skills_kb())
-
-@router.callback_query(F.data.startswith("skill_"), RegisterBrother.skills)
-async def reg_skill(callback: CallbackQuery, state: FSMContext):
-    if callback.data == "skill_done":
-        d = await state.get_data()
-        if not d.get("skills"):
-            await callback.answer("⚠️ Please select at least one skill!", show_alert=True)
-            return
-        await state.set_state(RegisterBrother.availability)
-        await callback.message.answer(
-            f"✅ Skills: *{', '.join(d['skills'])}*\n\nStep 5/5 — Select availability days:",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=avail_kb(),
-        )
-        await callback.answer()
-        return
-    
-    skill = callback.data[6:]
+    await state.set_state(RegisterBrother.confirm)
     d = await state.get_data()
-    skills = d.get("skills", [])
-    if skill in skills:
-        skills.remove(skill)
-    else:
-        skills.append(skill)
-    await state.update_data(skills=skills)
-    await callback.answer(f"Selected: {', '.join(skills) or 'none'}")
-
-@router.callback_query(F.data.startswith("av_"), RegisterBrother.availability)
-async def reg_avail(callback: CallbackQuery, state: FSMContext):
-    day = callback.data[3:]
-    if day == "done":
-        d = await state.get_data()
-        avail = d.get("availability", ["saturday"])
-        text = (
-            f"📋 *Confirm Registration*\n\n"
-            f"👤 Name: *{d['full_name']}*\n"
-            f"📱 Username: {d.get('telegram_username', '—')}\n"
-            f"📞 Phone: {d.get('phone', '—')}\n"
-            f"🎯 Skills: {', '.join(d['skills'])}\n"
-            f"📅 Available: {', '.join(avail)}"
-        )
-        await state.set_state(RegisterBrother.confirm)
-        await callback.message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=confirm_kb("reg"))
-        await callback.answer()
-        return
-    
-    d = await state.get_data()
-    avail = d.get("availability", [])
-    if day in avail:
-        avail.remove(day)
-    else:
-        avail.append(day)
-    await state.update_data(availability=avail)
-    await callback.answer(f"Days: {', '.join(avail) or 'none'}")
+    text = (
+        f"📋 *Confirm Registration*\n\n"
+        f"👤 Name: *{d['full_name']}*\n"
+        f"📱 Phone: {d.get('phone', '—')}\n\n"
+        f"_Admin will assign skills and availability once approved._"
+    )
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=confirm_kb("reg"))
 
 @router.callback_query(F.data.startswith("reg_"), RegisterBrother.confirm)
 async def reg_confirm(callback: CallbackQuery, state: FSMContext):
@@ -335,10 +278,10 @@ async def reg_confirm(callback: CallbackQuery, state: FSMContext):
     brother_info = {
         'telegram_id': telegram_id,
         'full_name': d['full_name'],
-        'skills': d['skills'],
-        'availability': d['availability'],
+        'skills': [],
+        'availability': [],
         'phone': d.get('phone'),
-        'telegram_username': d.get('telegram_username'),
+        'telegram_username': None,
         'serves': 0,
         'status': 'pending',
     }
@@ -363,10 +306,22 @@ async def cmd_view_schedule(message: Message):
     today = date.today()
     saturday = today + timedelta(days=(5 - today.weekday()) % 7)
     
-    stage = assignments_db.get('stage') or '—'
-    mic = ', '.join(assignments_db.get('microphone', [])) or '—'
-    audio = assignments_db.get('audio') or '—'
-    video = assignments_db.get('video') or '—'
+    # Convert telegram IDs to full names
+    stage_id = assignments_db.get('stage')
+    stage = brothers_db.get(stage_id, {}).get('full_name') if stage_id else None
+    stage = stage or '—'
+    
+    mic_ids = assignments_db.get('microphone', [])
+    mic_names = [brothers_db.get(mid, {}).get('full_name') for mid in mic_ids if mid in brothers_db]
+    mic = ', '.join(mic_names) if mic_names else '—'
+    
+    audio_id = assignments_db.get('audio')
+    audio = brothers_db.get(audio_id, {}).get('full_name') if audio_id else None
+    audio = audio or '—'
+    
+    video_id = assignments_db.get('video')
+    video = brothers_db.get(video_id, {}).get('full_name') if video_id else None
+    video = video or '—'
     
     text = (
         f"📅 *Saturday Service*\n"
@@ -896,10 +851,8 @@ async def cmd_pending_approval(message: Message, state: FSMContext):
     text = (
         f"⏳ *Pending Registration Review*\n\n"
         f"👤 Name: *{brother['full_name']}*\n"
-        f"🎯 Skills: {', '.join(brother['skills'])}\n"
-        f"📅 Available: {', '.join(brother['availability'])}\n"
-        f"📱 Phone: {brother.get('phone', '—')}\n"
-        f"👤 Username: {brother.get('telegram_username', '—')}\n\n"
+        f"📱 Phone: {brother.get('phone', '—')}\n\n"
+        f"_Skills and availability will be assigned after approval._\n\n"
         f"📊 Pending: {len(pending_approvals)} registration(s)"
     )
     
@@ -956,10 +909,8 @@ async def pending_approve(callback: CallbackQuery, state: FSMContext):
         text = (
             f"⏳ *Next Pending Registration*\n\n"
             f"👤 Name: *{brother['full_name']}*\n"
-            f"🎯 Skills: {', '.join(brother['skills'])}\n"
-            f"📅 Available: {', '.join(brother['availability'])}\n"
-            f"📱 Phone: {brother.get('phone', '—')}\n"
-            f"👤 Username: {brother.get('telegram_username', '—')}\n\n"
+            f"📱 Phone: {brother.get('phone', '—')}\n\n"
+            f"_Skills and availability will be assigned after approval._\n\n"
             f"📊 Remaining: {len(pending_approvals)}"
         )
         await callback.message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
@@ -991,10 +942,8 @@ async def pending_reject(callback: CallbackQuery, state: FSMContext):
         text = (
             f"⏳ *Next Pending Registration*\n\n"
             f"👤 Name: *{brother['full_name']}*\n"
-            f"🎯 Skills: {', '.join(brother['skills'])}\n"
-            f"📅 Available: {', '.join(brother['availability'])}\n"
-            f"📱 Phone: {brother.get('phone', '—')}\n"
-            f"👤 Username: {brother.get('telegram_username', '—')}\n\n"
+            f"📱 Phone: {brother.get('phone', '—')}\n\n"
+            f"_Skills and availability will be assigned after approval._\n\n"
             f"📊 Remaining: {len(pending_approvals)}"
         )
         await callback.message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
