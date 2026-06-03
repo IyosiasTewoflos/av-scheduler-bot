@@ -128,8 +128,9 @@ def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
 
 # ── Brother Storage ───────────────────────────────────────────────────────────
-brothers_db: dict = {}  # {brother_name: {full_name, skills, availability, phone, telegram_username}}
+brothers_db: dict = {}  # {telegram_id: {full_name, skills, availability, phone, telegram_username, telegram_id}}
 pending_approvals: list = []  # List of brothers waiting for approval
+user_registrations: dict = {}  # Track if user is currently registering
 assignments_db: dict = {  # Current assignments for Saturday
     'stage': None,
     'microphone': [],
@@ -142,20 +143,45 @@ router = Router()
 
 # /start
 @router.message(CommandStart())
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
     name = message.from_user.first_name
-    if is_admin(message.from_user.id):
+    telegram_id = message.from_user.id
+    
+    if is_admin(telegram_id):
         await message.answer(
             f"👋 Welcome, *{name}*!\n\nYou have *Admin* access to the A/V Scheduling System.\nUse the menu below.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=admin_menu(),
         )
-    else:
+    elif telegram_id in brothers_db:
+        # Already registered and approved
         await message.answer(
-            f"👋 Welcome, *{name}*!\n\nYou are registered with the Audio & Video Department.\nUse the menu to view your assignments.",
+            f"👋 Welcome back, *{name}*!\n\nYou are registered with the Audio & Video Department.\nUse the menu to view your assignments.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=brother_menu(),
         )
+    else:
+        # Not registered - offer registration
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="📝 Register as Brother", callback_data="start_register")
+        ]])
+        await message.answer(
+            f"👋 Welcome, *{name}*!\n\nYou are not yet registered with the A/V Department.\n\nWould you like to register?",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb,
+        )
+
+@router.callback_query(F.data == "start_register")
+async def start_registration(callback: CallbackQuery, state: FSMContext):
+    telegram_id = callback.from_user.id
+    await state.update_data(telegram_id=telegram_id)
+    await state.set_state(RegisterBrother.full_name)
+    await callback.message.answer(
+        "📝 *Self Registration*\n\nStep 1/5 — Enter your full name:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await callback.answer()
 
 # /help
 @router.message(Command("help"))
@@ -274,9 +300,13 @@ async def reg_confirm(callback: CallbackQuery, state: FSMContext):
         await callback.message.answer("❌ Registration cancelled.", reply_markup=admin_menu())
         await callback.answer()
         return
+    
     d = await state.get_data()
+    telegram_id = d.get('telegram_id', callback.from_user.id)
+    
     # Add brother to pending approvals
     brother_info = {
+        'telegram_id': telegram_id,
         'full_name': d['full_name'],
         'skills': d['skills'],
         'availability': d['availability'],
@@ -289,22 +319,12 @@ async def reg_confirm(callback: CallbackQuery, state: FSMContext):
     
     await callback.message.answer(
         f"✅ *{d['full_name']}* registration submitted!\n\n"
-        f"Awaiting admin approval. You will be notified once approved.",
+        f"⏳ Awaiting admin approval. You will be notified once approved.",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=admin_menu(),
+        reply_markup=ReplyKeyboardRemove(),
     )
     
-    # Notify all admins
-    admin_notification = (
-        f"🔔 *New Registration Pending Approval*\n\n"
-        f"👤 Name: *{d['full_name']}*\n"
-        f"🎯 Skills: {', '.join(d['skills'])}\n"
-        f"📅 Available: {', '.join(d['availability'])}\n"
-        f"📱 Phone: {d.get('phone', '—')}\n"
-        f"👤 Username: {d.get('telegram_username', '—')}\n\n"
-        f"Use /approvepending to review pending registrations."
-    )
-    logger.info(f"New registration pending: {d['full_name']}")
+    logger.info(f"New registration pending: {d['full_name']} (Telegram ID: {telegram_id})")
     
     await state.clear()
     await callback.answer()
@@ -348,7 +368,7 @@ async def cmd_auto_start(message: Message, state: FSMContext):
         return
     await state.set_state(AutoScheduleFlow.waiting_date)
     await message.answer(
-        "📅 Enter the program date in this format:\n*YYYY-MM-DD*\n\nExample: 2025-06-14",
+        "📅 Enter the program date in this format:\n*YYYY-MM-DD*\n\nExample: 2026-06-14",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=ReplyKeyboardRemove(),
     )
@@ -412,8 +432,8 @@ async def cmd_edit_start(message: Message, state: FSMContext):
     await state.set_state(EditBrother.choosing_brother)
     # Create inline keyboard with registered brother options
     kb_buttons = [
-        [InlineKeyboardButton(text=f"✏️ {name}", callback_data=f"edit_{i}")]
-        for i, name in enumerate(brothers_db.keys())
+        [InlineKeyboardButton(text=f"✏️ {brothers_db[tid]['full_name']}", callback_data=f"edit_{i}")]
+        for i, tid in enumerate(brothers_db.keys())
     ]
     kb_buttons.append([InlineKeyboardButton(text="❌ Cancel", callback_data="edit_cancel")])
     kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
@@ -432,15 +452,16 @@ async def edit_select_brother(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
     
-    # Get brother name from index
+    # Get brother by index from telegram_ids
     try:
         idx = int(callback.data[5:])
-        brother_name = list(brothers_db.keys())[idx]
+        telegram_id = list(brothers_db.keys())[idx]
+        brother_name = brothers_db[telegram_id]['full_name']
     except (ValueError, IndexError):
         await callback.answer("❌ Invalid selection", show_alert=True)
         return
     
-    await state.update_data(brother_name=brother_name)
+    await state.update_data(telegram_id=telegram_id, brother_name=brother_name)
     await state.set_state(EditBrother.choosing_field)
     
     # Show options for what to edit
@@ -469,8 +490,9 @@ async def edit_choose_field(callback: CallbackQuery, state: FSMContext):
     
     field = callback.data[11:]
     d = await state.get_data()
+    telegram_id = d.get("telegram_id")
     brother_name = d.get("brother_name")
-    brother = brothers_db.get(brother_name, {})
+    brother = brothers_db.get(telegram_id, {})
     
     await state.update_data(editing_field=field)
     await state.set_state(EditBrother.editing_value)
@@ -582,19 +604,20 @@ async def edit_confirm(callback: CallbackQuery, state: FSMContext):
         return
     
     d = await state.get_data()
+    telegram_id = d.get("telegram_id")
     brother_name = d.get("brother_name")
     field = d.get("editing_field")
     
     # Update the brother record
-    if brother_name in brothers_db:
+    if telegram_id in brothers_db:
         if field == "skills":
-            brothers_db[brother_name]['skills'] = d.get('skills', [])
+            brothers_db[telegram_id]['skills'] = d.get('skills', [])
         elif field == "availability":
-            brothers_db[brother_name]['availability'] = d.get('availability', ["saturday"])
+            brothers_db[telegram_id]['availability'] = d.get('availability', ["saturday"])
         elif field == "phone":
-            brothers_db[brother_name]['phone'] = d.get('phone')
+            brothers_db[telegram_id]['phone'] = d.get('phone')
         elif field == "username":
-            brothers_db[brother_name]['telegram_username'] = d.get('telegram_username')
+            brothers_db[telegram_id]['telegram_username'] = d.get('telegram_username')
     
     await callback.message.answer(
         f"✅ *{brother_name}* has been updated successfully!",
@@ -619,8 +642,8 @@ async def cmd_delete_start(message: Message, state: FSMContext):
     await state.set_state(DeleteBrother.choosing_brother)
     # Create inline keyboard with registered brother options
     kb_buttons = [
-        [InlineKeyboardButton(text=f"🗑️ {name}", callback_data=f"del_{i}")]
-        for i, name in enumerate(brothers_db.keys())
+        [InlineKeyboardButton(text=f"🗑️ {brothers_db[tid]['full_name']}", callback_data=f"del_{i}")]
+        for i, tid in enumerate(brothers_db.keys())
     ]
     kb_buttons.append([InlineKeyboardButton(text="❌ Cancel", callback_data="del_cancel")])
     kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
@@ -643,15 +666,16 @@ async def del_select_brother(callback: CallbackQuery, state: FSMContext):
     if "confirm" in callback.data:
         return
     
-    # Get brother name from index
+    # Get telegram_id from index
     try:
         idx = int(callback.data[4:])
-        brother_name = list(brothers_db.keys())[idx]
+        telegram_id = list(brothers_db.keys())[idx]
+        brother_name = brothers_db[telegram_id]['full_name']
     except (ValueError, IndexError):
         await callback.answer("❌ Invalid selection", show_alert=True)
         return
     
-    await state.update_data(brother_name=brother_name)
+    await state.update_data(telegram_id=telegram_id, brother_name=brother_name)
     await state.set_state(DeleteBrother.confirm_delete)
     
     kb = confirm_kb("del_confirm")
@@ -673,11 +697,12 @@ async def del_confirm(callback: CallbackQuery, state: FSMContext):
         return
     
     d = await state.get_data()
+    telegram_id = d.get("telegram_id")
     brother_name = d.get("brother_name")
     
     # Delete from storage
-    if brother_name in brothers_db:
-        del brothers_db[brother_name]
+    if telegram_id in brothers_db:
+        del brothers_db[telegram_id]
     
     await callback.message.answer(
         f"✅ *{brother_name}* has been successfully deleted from the registry!\n\n"
@@ -724,8 +749,8 @@ async def sched_choose_role(callback: CallbackQuery, state: FSMContext):
     await state.set_state(EditSchedule.choosing_brother)
     
     kb_buttons = [
-        [InlineKeyboardButton(text=f"✅ {name}", callback_data=f"sched_brother_{i}")]
-        for i, name in enumerate(brothers_db.keys())
+        [InlineKeyboardButton(text=f"✅ {brothers_db[tid]['full_name']}", callback_data=f"sched_brother_{i}")]
+        for i, tid in enumerate(brothers_db.keys())
     ]
     kb_buttons.append([InlineKeyboardButton(text="❌ None", callback_data="sched_brother_none")])
     kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
@@ -743,18 +768,18 @@ async def sched_choose_brother(callback: CallbackQuery, state: FSMContext):
     role = d.get("role")
     
     if callback.data == "sched_brother_none":
-        brother_name = None
+        telegram_id = None
         chosen_text = "None"
     else:
         try:
             idx = int(callback.data[14:])
-            brother_name = list(brothers_db.keys())[idx]
-            chosen_text = brother_name
+            telegram_id = list(brothers_db.keys())[idx]
+            chosen_text = brothers_db[telegram_id]['full_name']
         except (ValueError, IndexError):
             await callback.answer("❌ Invalid selection", show_alert=True)
             return
     
-    await state.update_data(chosen_brother=brother_name)
+    await state.update_data(chosen_brother=telegram_id)
     await state.set_state(EditSchedule.confirm_edit)
     
     kb = confirm_kb("sched_confirm")
@@ -835,7 +860,11 @@ async def pending_approve(callback: CallbackQuery, state: FSMContext):
         return
     
     brother = pending_approvals.pop(0)
-    brothers_db[brother['full_name']] = {
+    telegram_id = brother['telegram_id']
+    
+    # Save to brothers_db using telegram_id as key
+    brothers_db[telegram_id] = {
+        'telegram_id': telegram_id,
         'full_name': brother['full_name'],
         'skills': brother['skills'],
         'availability': brother['availability'],
