@@ -54,13 +54,18 @@ class RegisterBrother(StatesGroup):
 class AutoScheduleFlow(StatesGroup):
     waiting_date = State()
 
+class DeleteBrother(StatesGroup):
+    choosing_brother = State()
+    confirm_delete = State()
+
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 def admin_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📋 View Schedule"),   KeyboardButton(text="⚡ Auto-Schedule")],
             [KeyboardButton(text="👥 Brother List"),    KeyboardButton(text="➕ Register Brother")],
-            [KeyboardButton(text="📊 Report"),           KeyboardButton(text="🔔 Send Reminders")],
+            [KeyboardButton(text="�️ Delete Brother"),   KeyboardButton(text="📊 Report")],
+            [KeyboardButton(text="🔔 Send Reminders")],
         ],
         resize_keyboard=True,
     )
@@ -330,6 +335,74 @@ async def cmd_brother_list(message: Message):
         "🟢 *Grace Tadesse* — microphone — 10 serves"
     )
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
+
+# ── Delete Brother ─────────────────────────────────────────────────────────────
+@router.message(Command("deletebrother"))
+@router.message(F.text == "🗑️ Delete Brother")
+async def cmd_delete_start(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ This command is for admins only.")
+        return
+    await state.set_state(DeleteBrother.choosing_brother)
+    # Create inline keyboard with brother options
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑️ Elias Kebede", callback_data="del_elias_kebede")],
+        [InlineKeyboardButton(text="🗑️ Samuel Mekonnen", callback_data="del_samuel_mekonnen")],
+        [InlineKeyboardButton(text="🗑️ Daniel Tesfaye", callback_data="del_daniel_tesfaye")],
+        [InlineKeyboardButton(text="🗑️ John Negash", callback_data="del_john_negash")],
+        [InlineKeyboardButton(text="🗑️ Ruth Bekele", callback_data="del_ruth_bekele")],
+        [InlineKeyboardButton(text="🗑️ Michael Alemu", callback_data="del_michael_alemu")],
+        [InlineKeyboardButton(text="🗑️ James Oluwole", callback_data="del_james_oluwole")],
+        [InlineKeyboardButton(text="🗑️ Grace Tadesse", callback_data="del_grace_tadesse")],
+        [InlineKeyboardButton(text="❌ Cancel", callback_data="del_cancel")],
+    ])
+    await message.answer(
+        "🗑️ *Delete Brother*\n\nSelect a brother to delete:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb,
+    )
+
+@router.callback_query(F.data.startswith("del_"), DeleteBrother.choosing_brother)
+async def del_select_brother(callback: CallbackQuery, state: FSMContext):
+    if callback.data == "del_cancel":
+        await state.clear()
+        await callback.message.answer("❌ Deletion cancelled.", reply_markup=admin_menu())
+        await callback.answer()
+        return
+    
+    # Extract brother name from callback data
+    brother_name = callback.data[4:].replace("_", " ").title()
+    await state.update_data(brother_name=brother_name)
+    await state.set_state(DeleteBrother.confirm_delete)
+    
+    kb = confirm_kb("del_confirm")
+    await callback.message.answer(
+        f"⚠️ *Confirm Deletion*\n\n"
+        f"Are you sure you want to delete *{brother_name}* from the registry?\n\n"
+        f"This action cannot be undone.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb,
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("del_confirm_"), DeleteBrother.confirm_delete)
+async def del_confirm(callback: CallbackQuery, state: FSMContext):
+    if callback.data == "del_confirm_no":
+        await state.clear()
+        await callback.message.answer("❌ Deletion cancelled.", reply_markup=admin_menu())
+        await callback.answer()
+        return
+    
+    d = await state.get_data()
+    brother_name = d.get("brother_name")
+    await callback.message.answer(
+        f"✅ *{brother_name}* has been successfully deleted from the registry!\n\n"
+        f"Their assignments have been marked as unassigned.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=admin_menu(),
+    )
+    await state.clear()
+    await callback.answer()
 
 # ── My Assignments ─────────────────────────────────────────────────────────────
 @router.message(Command("myassignments"))
