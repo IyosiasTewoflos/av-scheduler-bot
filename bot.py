@@ -112,6 +112,9 @@ def assign_kb(assignment_id: str) -> InlineKeyboardMarkup:
 def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
 
+# ── Brother Storage ───────────────────────────────────────────────────────────
+brothers_db: dict = {}  # {brother_name: {full_name, skills, availability, phone, telegram_username}}
+
 # ── Router ────────────────────────────────────────────────────────────────────
 router = Router()
 
@@ -141,6 +144,7 @@ async def cmd_help(message: Message):
         "/registerbrother — Register a new brother\n"
         "/autoschedule — Auto-generate assignments\n"
         "/brotherlist — List all brothers\n"
+        "/deletebrother — Delete a brother\n"
         "/sendreminders — Send reminders\n"
         "/report — Monthly report\n\n"
         "👤 *Everyone:*\n"
@@ -186,8 +190,7 @@ async def reg_phone(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("skill_"), RegisterBrother.skills)
 async def reg_skill(callback: CallbackQuery, state: FSMContext):
-    skill = callback.data[6:]
-    if skill == "done":
+    if callback.data == "skill_done":
         d = await state.get_data()
         if not d.get("skills"):
             await callback.answer("⚠️ Please select at least one skill!", show_alert=True)
@@ -200,6 +203,8 @@ async def reg_skill(callback: CallbackQuery, state: FSMContext):
         )
         await callback.answer()
         return
+    
+    skill = callback.data[6:]
     d = await state.get_data()
     skills = d.get("skills", [])
     if skill in skills:
@@ -227,6 +232,7 @@ async def reg_avail(callback: CallbackQuery, state: FSMContext):
         await callback.message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=confirm_kb("reg"))
         await callback.answer()
         return
+    
     d = await state.get_data()
     avail = d.get("availability", [])
     if day in avail:
@@ -244,6 +250,15 @@ async def reg_confirm(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
     d = await state.get_data()
+    # Save brother to storage
+    brothers_db[d['full_name']] = {
+        'full_name': d['full_name'],
+        'skills': d['skills'],
+        'availability': d['availability'],
+        'phone': d.get('phone'),
+        'telegram_username': d.get('telegram_username'),
+        'serves': 0,
+    }
     await callback.message.answer(
         f"✅ *{d['full_name']}* has been registered successfully!\n\n"
         f"They can now message the bot to access their assignments.",
@@ -323,17 +338,16 @@ async def cmd_brother_list(message: Message):
     if not is_admin(message.from_user.id):
         await message.answer("❌ This command is for admins only.")
         return
-    text = (
-        "👥 *Brothers Registry*\n\n"
-        "🟢 *Elias Kebede* — stage, audio — 12 serves\n"
-        "🟢 *Samuel Mekonnen* — audio — 9 serves\n"
-        "🟢 *Daniel Tesfaye* — mic, stage — 7 serves\n"
-        "🟢 *John Negash* — microphone — 5 serves\n"
-        "🟢 *Ruth Bekele* — video — 11 serves\n"
-        "🟢 *Michael Alemu* — stage, mic — 8 serves\n"
-        "🟢 *James Oluwole* — audio, video — 6 serves\n"
-        "🟢 *Grace Tadesse* — microphone — 10 serves"
-    )
+    
+    if not brothers_db:
+        await message.answer("👥 *Brothers Registry*\n\nNo brothers registered yet.", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    text = "👥 *Brothers Registry*\n\n"
+    for name, brother in brothers_db.items():
+        skills_str = ', '.join(brother['skills']) if brother['skills'] else 'None'
+        text += f"🟢 *{brother['full_name']}* — {skills_str} — {brother['serves']} serves\n"
+    
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
 # ── Delete Brother ─────────────────────────────────────────────────────────────
@@ -343,19 +357,20 @@ async def cmd_delete_start(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         await message.answer("❌ This command is for admins only.")
         return
+    
+    if not brothers_db:
+        await message.answer("❌ No brothers registered to delete.", reply_markup=admin_menu())
+        return
+    
     await state.set_state(DeleteBrother.choosing_brother)
-    # Create inline keyboard with brother options
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🗑️ Elias Kebede", callback_data="del_elias_kebede")],
-        [InlineKeyboardButton(text="🗑️ Samuel Mekonnen", callback_data="del_samuel_mekonnen")],
-        [InlineKeyboardButton(text="🗑️ Daniel Tesfaye", callback_data="del_daniel_tesfaye")],
-        [InlineKeyboardButton(text="🗑️ John Negash", callback_data="del_john_negash")],
-        [InlineKeyboardButton(text="🗑️ Ruth Bekele", callback_data="del_ruth_bekele")],
-        [InlineKeyboardButton(text="🗑️ Michael Alemu", callback_data="del_michael_alemu")],
-        [InlineKeyboardButton(text="🗑️ James Oluwole", callback_data="del_james_oluwole")],
-        [InlineKeyboardButton(text="🗑️ Grace Tadesse", callback_data="del_grace_tadesse")],
-        [InlineKeyboardButton(text="❌ Cancel", callback_data="del_cancel")],
-    ])
+    # Create inline keyboard with registered brother options
+    kb_buttons = [
+        [InlineKeyboardButton(text=f"🗑️ {name}", callback_data=f"del_{i}")]
+        for i, name in enumerate(brothers_db.keys())
+    ]
+    kb_buttons.append([InlineKeyboardButton(text="❌ Cancel", callback_data="del_cancel")])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
+    
     await message.answer(
         "🗑️ *Delete Brother*\n\nSelect a brother to delete:",
         parse_mode=ParseMode.MARKDOWN,
@@ -370,8 +385,14 @@ async def del_select_brother(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
     
-    # Extract brother name from callback data
-    brother_name = callback.data[4:].replace("_", " ").title()
+    # Get brother name from index
+    try:
+        idx = int(callback.data[4:])
+        brother_name = list(brothers_db.keys())[idx]
+    except (ValueError, IndexError):
+        await callback.answer("❌ Invalid selection", show_alert=True)
+        return
+    
     await state.update_data(brother_name=brother_name)
     await state.set_state(DeleteBrother.confirm_delete)
     
@@ -395,6 +416,11 @@ async def del_confirm(callback: CallbackQuery, state: FSMContext):
     
     d = await state.get_data()
     brother_name = d.get("brother_name")
+    
+    # Delete from storage
+    if brother_name in brothers_db:
+        del brothers_db[brother_name]
+    
     await callback.message.answer(
         f"✅ *{brother_name}* has been successfully deleted from the registry!\n\n"
         f"Their assignments have been marked as unassigned.",
