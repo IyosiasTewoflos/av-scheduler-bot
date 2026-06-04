@@ -85,12 +85,10 @@ schedule_db: dict = {}
 
 # ── FSM States ────────────────────────────────────────────────────────────────
 class RegisterBrother(StatesGroup):
-    full_name    = State()
-    username     = State()
-    phone        = State()
-    skills       = State()
-    availability = State()
-    confirm      = State()
+    full_name = State()
+    phone     = State()
+    skills    = State()
+    confirm   = State()
 
 class SelfRegister(StatesGroup):
     full_name = State()
@@ -345,28 +343,22 @@ async def reg_start(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         await message.answer("❌ Admin only."); return
     await state.set_state(RegisterBrother.full_name)
-    await message.answer("📝 *Register New Brother*\n\nStep 1/5 — Full name:",
+    await message.answer("📝 *Register New Brother*\n\nStep 1/4 — Full name:",
                          parse_mode=ParseMode.MARKDOWN, reply_markup=ReplyKeyboardRemove())
 
 @router.message(RegisterBrother.full_name)
 async def reg_name(message: Message, state: FSMContext):
-    await state.update_data(full_name=message.text.strip(), skills=[], availability=["saturday"])
-    await state.set_state(RegisterBrother.username)
-    await message.answer("Step 2/5 — Telegram username (@username) or *skip*:", parse_mode=ParseMode.MARKDOWN)
-
-@router.message(RegisterBrother.username)
-async def reg_uname(message: Message, state: FSMContext):
-    v = message.text.strip()
-    await state.update_data(telegram_username=None if v.lower()=="skip" else v)
+    await state.update_data(full_name=message.text.strip(), skills=[])
     await state.set_state(RegisterBrother.phone)
-    await message.answer("Step 3/5 — Phone number or *skip*:", parse_mode=ParseMode.MARKDOWN)
+    await message.answer("Step 2/4 — Phone number (e.g. +251911000001) or type *skip*:", parse_mode=ParseMode.MARKDOWN)
+
 
 @router.message(RegisterBrother.phone)
 async def reg_phone(message: Message, state: FSMContext):
     v = message.text.strip()
     await state.update_data(phone=None if v.lower()=="skip" else v)
     await state.set_state(RegisterBrother.skills)
-    await message.answer("Step 4/5 — Select skills:", reply_markup=skills_kb())
+    await message.answer("Step 3/4 — Select skills (tap all that apply, then Done):", reply_markup=skills_kb())
 
 @router.callback_query(F.data.startswith("skill_"), RegisterBrother.skills)
 async def reg_skill(callback: CallbackQuery, state: FSMContext):
@@ -375,10 +367,14 @@ async def reg_skill(callback: CallbackQuery, state: FSMContext):
         d = await state.get_data()
         if not d.get("skills"):
             await callback.answer("⚠️ Select at least one skill!", show_alert=True); return
-        await state.set_state(RegisterBrother.availability)
+        await state.set_state(RegisterBrother.confirm)
+        d2 = await state.get_data()
         await callback.message.answer(
-            f"✅ Skills: *{', '.join(d['skills'])}*\n\nStep 5/5 — Availability:",
-            parse_mode=ParseMode.MARKDOWN, reply_markup=avail_kb())
+            f"📋 *Confirm Registration*\n\n"
+            f"👤 *{d2['full_name']}*\n"
+            f"📞 {d2.get('phone','—')}\n"
+            f"🎯 Skills: {', '.join(d2['skills'])}",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=confirm_kb("reg"))
         await callback.answer(); return
     d = await state.get_data()
     skills = d.get("skills", [])
@@ -388,27 +384,6 @@ async def reg_skill(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_reply_markup(reply_markup=skills_kb(skills))
     await callback.answer(f"Selected: {', '.join(skills) or 'none'}")
 
-@router.callback_query(F.data.startswith("av_"), RegisterBrother.availability)
-async def reg_avail(callback: CallbackQuery, state: FSMContext):
-    day = callback.data[3:]
-    if day == "done":
-        d = await state.get_data()
-        avail = d.get("availability", ["saturday"])
-        text = (f"📋 *Confirm Registration*\n\n"
-                f"👤 *{d['full_name']}*\n"
-                f"📱 {d.get('telegram_username','—')}  📞 {d.get('phone','—')}\n"
-                f"🎯 {', '.join(d['skills'])}\n"
-                f"📅 {', '.join(avail)}")
-        await state.set_state(RegisterBrother.confirm)
-        await callback.message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=confirm_kb("reg"))
-        await callback.answer(); return
-    d = await state.get_data()
-    avail = d.get("availability", [])
-    if day in avail: avail.remove(day)
-    else: avail.append(day)
-    await state.update_data(availability=avail)
-    await callback.message.edit_reply_markup(reply_markup=avail_kb(avail))
-    await callback.answer(f"Days: {', '.join(avail) or 'none'}")
 
 @router.callback_query(F.data.startswith("reg_"), RegisterBrother.confirm)
 async def reg_confirm(callback: CallbackQuery, state: FSMContext):
@@ -425,11 +400,11 @@ async def reg_confirm(callback: CallbackQuery, state: FSMContext):
         "telegram_id": fake_id,
         "full_name": d["full_name"],
         "skills": d.get("skills", []),
-        "availability": d.get("availability", ["saturday"]),
+        "availability": ["saturday"],
         "phone": d.get("phone"),
-        "telegram_username": d.get("telegram_username"),
+        "telegram_username": None,
         "serves": 0,
-        "linked": False,   # will be True once they /start the bot
+        "linked": False,
     }
     await callback.message.answer(
         f"✅ *{d['full_name']}* registered!\n\n"
