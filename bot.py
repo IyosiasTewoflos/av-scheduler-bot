@@ -1,5 +1,7 @@
 """
-AV Department Scheduling Bot - Clean Version
+AV Department Scheduling Bot - v3
+Fixed: Auto-schedule uses only registered brothers
+Fixed: Program date = next Saturday automatically (start of service week)
 """
 from __future__ import annotations
 import asyncio
@@ -8,7 +10,6 @@ import os
 from datetime import date, timedelta
 from pathlib import Path
 
-# Load .env file
 try:
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).parent / ".env")
@@ -34,81 +35,121 @@ from aiogram.types import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── Config ───────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = set(map(int, os.getenv("ADMIN_IDS", "0").split(",")))
-
-# Global bot instance for sending notifications
-bot_instance: Bot = None
 
 if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
     logger.error("❌ BOT_TOKEN not set! Add it to your .env file.")
     exit(1)
 
-# ── FSM States ───────────────────────────────────────────────────────────────
+bot_instance: Bot = None
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def is_admin(uid: int) -> bool:
+    return uid in ADMIN_IDS
+
+def get_next_saturday() -> date:
+    """Return this week's Saturday (or today if today is Saturday)."""
+    today = date.today()
+    days_ahead = (5 - today.weekday()) % 7   # Saturday = weekday 5
+    return today + timedelta(days=days_ahead)
+
+def week_label(program_date: date) -> str:
+    """Return a human-readable week label like 'This Week (June 7)'."""
+    today = date.today()
+    saturday = get_next_saturday()
+    if program_date == saturday:
+        return f"This Week ({program_date.strftime('%B %d')})"
+    elif program_date == saturday + timedelta(weeks=1):
+        return f"Next Week ({program_date.strftime('%B %d')})"
+    else:
+        return program_date.strftime('%B %d, %Y')
+
+async def notify_admins(bot: Bot, text: str, kb=None):
+    for aid in ADMIN_IDS:
+        try:
+            await bot.send_message(aid, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        except Exception as e:
+            logger.warning("Could not notify admin %s: %s", aid, e)
+
+# ── Stores ────────────────────────────────────────────────────────────────────
+# brothers_db: keyed by telegram_id (int)
+# {telegram_id: {full_name, skills, availability, phone, telegram_username, serves}}
+brothers_db: dict = {}
+pending_approvals: list = []   # list of brother dicts awaiting admin approval
+
+# schedule_db: the active generated schedule
+# {program_date, week_label, assignments: {section: [telegram_ids]}}
+schedule_db: dict = {}
+
+# ── FSM States ────────────────────────────────────────────────────────────────
 class RegisterBrother(StatesGroup):
     full_name    = State()
+    username     = State()
     phone        = State()
+    skills       = State()
+    availability = State()
     confirm      = State()
 
-class AutoScheduleFlow(StatesGroup):
-    waiting_date = State()
+class SelfRegister(StatesGroup):
+    full_name = State()
+    phone     = State()
+    confirm   = State()
 
-class DeleteBrother(StatesGroup):
-    choosing_brother = State()
-    confirm_delete = State()
+class EditBrotherFlow(StatesGroup):
+    choose_brother  = State()
+    choose_field    = State()
+    enter_value     = State()
+    choose_skills   = State()
+    choose_avail    = State()
 
-class EditBrother(StatesGroup):
-    choosing_brother = State()
-    choosing_field = State()
-    editing_value = State()
-    confirm_edit = State()
+class DeleteBrotherFlow(StatesGroup):
+    choose_brother = State()
+    confirm        = State()
 
-class EditSchedule(StatesGroup):
-    choosing_role = State()
-    choosing_brother = State()
-    confirm_edit = State()
-
-class PendingApproval(StatesGroup):
-    approving = State()
+class EditScheduleFlow(StatesGroup):
+    choose_section     = State()
+    choose_action      = State()
+    choose_new_brother = State()
 
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 def admin_menu() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📋 View Schedule"),   KeyboardButton(text="✏️ Edit Schedule")],
-            [KeyboardButton(text="👥 Brother List"),    KeyboardButton(text="➕ Register Brother")],
-            [KeyboardButton(text="✏️ Edit Brother"),     KeyboardButton(text="🗑️ Delete Brother")],
-            [KeyboardButton(text="⏳ Pending Approval"), KeyboardButton(text="⚡ Auto-Schedule")],
-            [KeyboardButton(text="📊 Report"),           KeyboardButton(text="🔔 Send Reminders")],
-        ],
-        resize_keyboard=True,
-    )
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="📋 View Schedule"),   KeyboardButton(text="⚡ Auto-Schedule")],
+        [KeyboardButton(text="👥 Brother List"),    KeyboardButton(text="➕ Register Brother")],
+        [KeyboardButton(text="✏️ Edit Brother"),    KeyboardButton(text="🗑 Delete Brother")],
+        [KeyboardButton(text="📝 Edit Schedule"),   KeyboardButton(text="⏳ Pending Approvals")],
+        [KeyboardButton(text="📊 Report"),           KeyboardButton(text="🔔 Send Reminders")],
+    ], resize_keyboard=True)
 
 def brother_menu() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📅 My Assignments"), KeyboardButton(text="✅ Set Availability")],
-            [KeyboardButton(text="📋 This Week's Schedule")],
-        ],
-        resize_keyboard=True,
-    )
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="📅 My Assignments"), KeyboardButton(text="✅ Set Availability")],
+        [KeyboardButton(text="📋 This Week's Schedule")],
+    ], resize_keyboard=True)
 
-def skills_kb() -> InlineKeyboardMarkup:
+def skills_kb(selected: list | None = None) -> InlineKeyboardMarkup:
+    selected = selected or []
+    def lbl(s, icon):
+        return f"✅ {icon} {s.capitalize()}" if s in selected else f"{icon} {s.capitalize()}"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎭 Stage",      callback_data="skill_stage"),
-         InlineKeyboardButton(text="🎤 Microphone", callback_data="skill_microphone")],
-        [InlineKeyboardButton(text="🔊 Audio",      callback_data="skill_audio"),
-         InlineKeyboardButton(text="🎥 Video",      callback_data="skill_video")],
-        [InlineKeyboardButton(text="✅ Done",        callback_data="skill_done")],
+        [InlineKeyboardButton(text=lbl("stage","🎭"),      callback_data="skill_stage"),
+         InlineKeyboardButton(text=lbl("microphone","🎤"), callback_data="skill_microphone")],
+        [InlineKeyboardButton(text=lbl("audio","🔊"),      callback_data="skill_audio"),
+         InlineKeyboardButton(text=lbl("video","🎥"),      callback_data="skill_video")],
+        [InlineKeyboardButton(text="✅ Done",               callback_data="skill_done")],
     ])
 
-def avail_kb() -> InlineKeyboardMarkup:
+def avail_kb(selected: list | None = None) -> InlineKeyboardMarkup:
+    selected = selected or []
+    def lbl(d, label):
+        return f"✅ {label}" if d in selected else label
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Saturday", callback_data="av_saturday"),
-         InlineKeyboardButton(text="Sunday",   callback_data="av_sunday")],
-        [InlineKeyboardButton(text="Weekdays", callback_data="av_weekday")],
-        [InlineKeyboardButton(text="💾 Save",  callback_data="av_done")],
+        [InlineKeyboardButton(text=lbl("saturday","Saturday"), callback_data="av_saturday"),
+         InlineKeyboardButton(text=lbl("sunday","Sunday"),     callback_data="av_sunday")],
+        [InlineKeyboardButton(text=lbl("weekday","Weekdays"),  callback_data="av_weekday")],
+        [InlineKeyboardButton(text="💾 Save",                  callback_data="av_done")],
     ])
 
 def confirm_kb(prefix: str) -> InlineKeyboardMarkup:
@@ -123,850 +164,775 @@ def assign_kb(assignment_id: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="❌ I can't make it", callback_data=f"decline_{assignment_id}"),
     ]])
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def is_admin(uid: int) -> bool:
-    return uid in ADMIN_IDS
+def brothers_list_kb(prefix: str, exclude_ids: list | None = None) -> InlineKeyboardMarkup:
+    """Inline keyboard of all registered brothers."""
+    exclude_ids = exclude_ids or []
+    rows = []
+    for tid, b in sorted(brothers_db.items(), key=lambda x: x[1]["full_name"]):
+        if tid not in exclude_ids:
+            rows.append([InlineKeyboardButton(
+                text=b["full_name"],
+                callback_data=f"{prefix}:{tid}"
+            )])
+    if not rows:
+        rows.append([InlineKeyboardButton(text="(no brothers available)", callback_data="noop")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
-# ── Brother Storage ───────────────────────────────────────────────────────────
-brothers_db: dict = {}  # {telegram_id: {full_name, skills, availability, phone, telegram_username, telegram_id}}
-pending_approvals: list = []  # List of brothers waiting for approval
-user_registrations: dict = {}  # Track if user is currently registering
-assignments_db: dict = {  # Current assignments for Saturday
-    'stage': None,
-    'microphone': [],
-    'audio': None,
-    'video': None,
-}
+def sections_kb() -> InlineKeyboardMarkup:
+    icons = {"stage":"🎭","microphone":"🎤","audio":"🔊","video":"🎥"}
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{icons[s]} {s.capitalize()}", callback_data=f"editsec:{s}")]
+        for s in ["stage","microphone","audio","video"]
+    ] + [[InlineKeyboardButton(text="❌ Cancel", callback_data="editsec:cancel")]])
 
-# ── Notification Helper Functions ──────────────────────────────────────────────
-async def notify_user(telegram_id: int, text: str, parse_mode: str = ParseMode.MARKDOWN) -> bool:
-    """Send a notification message to a user. Returns True if successful."""
-    if not bot_instance:
-        logger.warning(f"Bot instance not available for notification to {telegram_id}")
-        return False
-    try:
-        await bot_instance.send_message(telegram_id, text, parse_mode=parse_mode)
-        logger.info(f"Notification sent to {telegram_id}")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to send notification to {telegram_id}: {e}")
-        return False
+def edit_fields_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👤 Full Name",   callback_data="ef:full_name")],
+        [InlineKeyboardButton(text="📱 Username",    callback_data="ef:username")],
+        [InlineKeyboardButton(text="📞 Phone",       callback_data="ef:phone")],
+        [InlineKeyboardButton(text="🎯 Skills",      callback_data="ef:skills")],
+        [InlineKeyboardButton(text="📅 Availability",callback_data="ef:availability")],
+        [InlineKeyboardButton(text="❌ Cancel",       callback_data="ef:cancel")],
+    ])
 
-async def notify_all_admins(text: str, parse_mode: str = ParseMode.MARKDOWN) -> None:
-    """Send a notification to all admin users."""
-    for admin_id in ADMIN_IDS:
-        await notify_user(admin_id, text, parse_mode)
+# ── Format schedule text ──────────────────────────────────────────────────────
+def format_schedule_text(admin: bool = False) -> str:
+    if not schedule_db:
+        saturday = get_next_saturday()
+        return (f"📅 *Schedule — This Week ({saturday.strftime('%B %d, %Y')})*\n\n"
+                f"⚠️ No schedule generated yet.\nUse ⚡ Auto-Schedule to create one.")
 
-async def notify_all_brothers(text: str, parse_mode: str = ParseMode.MARKDOWN) -> None:
-    """Send a notification to all registered brothers."""
-    for telegram_id in brothers_db.keys():
-        await notify_user(telegram_id, text, parse_mode)
+    icons = {"stage":"🎭","microphone":"🎤","audio":"🔊","video":"🎥"}
+    wl = schedule_db.get("week_label","This Week")
+    prog_date = schedule_db.get("program_date","")
+    text = f"📅 *Schedule — {wl}*\n🗓 {prog_date}  ⏰ 3:00 PM\n\n👥 *Assignments:*\n"
 
-# ── Router ────────────────────────────────────────────────────────────────────
+    for section in ["stage","microphone","audio","video"]:
+        ids = schedule_db["assignments"].get(section, [])
+        names = []
+        for tid in ids:
+            b = brothers_db.get(tid)
+            names.append(b["full_name"] if b else f"Unknown({tid})")
+        value = ", ".join(names) if names else "_(unassigned)_"
+        text += f"{icons[section]} *{section.capitalize()}*: {value}\n"
+
+    if admin:
+        text += f"\n📌 *Status: Pending Approval*"
+    return text
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ROUTER
+# ══════════════════════════════════════════════════════════════════════════════
 router = Router()
 
-# /start
+# ── /start ────────────────────────────────────────────────────────────────────
 @router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
+async def cmd_start(message: Message):
+    uid  = message.from_user.id
     name = message.from_user.first_name
-    telegram_id = message.from_user.id
-    
-    if is_admin(telegram_id):
-        await message.answer(
-            f"👋 Welcome, *{name}*!\n\nYou have *Admin* access to the A/V Scheduling System.\nUse the menu below.",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=admin_menu(),
-        )
-    elif telegram_id in brothers_db:
-        # Already registered and approved
-        await message.answer(
-            f"👋 Welcome back, *{name}*!\n\nYou are registered with the Audio & Video Department.\nUse the menu to view your assignments.",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=brother_menu(),
-        )
-    else:
-        # Not registered - offer registration
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="📝 Register as Brother", callback_data="start_register")
-        ]])
-        await message.answer(
-            f"👋 Welcome, *{name}*!\n\nYou are not yet registered with the A/V Department.\n\nWould you like to register?",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb,
-        )
 
-@router.callback_query(F.data == "start_register")
-async def start_registration(callback: CallbackQuery, state: FSMContext):
-    telegram_id = callback.from_user.id
-    await state.update_data(telegram_id=telegram_id)
-    await state.set_state(RegisterBrother.full_name)
+    if is_admin(uid):
+        await message.answer(
+            f"👋 Welcome, *{name}*!\n\nYou have *Admin* access.",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=admin_menu())
+        return
+
+    if uid in brothers_db:
+        await message.answer(
+            f"👋 Welcome back, *{brothers_db[uid]['full_name']}*!\nUse the menu below.",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=brother_menu())
+        return
+
+    # Check if already pending
+    already = any(p["telegram_id"] == uid for p in pending_approvals)
+    if already:
+        await message.answer(
+            f"⏳ Hi *{name}*! Your registration is still pending admin approval.\nPlease wait. 🙏",
+            parse_mode=ParseMode.MARKDOWN)
+        return
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📝 Register", callback_data="self_register")
+    ]])
+    await message.answer(
+        f"👋 Hi *{name}*!\n\nYou are not yet registered in the A/V Department.\nWould you like to register?",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+
+# ── Self-register flow (for brothers) ────────────────────────────────────────
+@router.callback_query(F.data == "self_register")
+async def self_reg_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(SelfRegister.full_name)
     await callback.message.answer(
-        "📝 *Self Registration*\n\nStep 1/2 — Enter your full name:",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=ReplyKeyboardRemove(),
-    )
+        "📝 *Register*\n\nStep 1/2 — Enter your full name:",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=ReplyKeyboardRemove())
     await callback.answer()
 
-# /help
+@router.message(SelfRegister.full_name)
+async def self_reg_name(message: Message, state: FSMContext):
+    await state.update_data(full_name=message.text.strip())
+    await state.set_state(SelfRegister.phone)
+    await message.answer("Step 2/2 — Phone number or type *skip*:", parse_mode=ParseMode.MARKDOWN)
+
+@router.message(SelfRegister.phone)
+async def self_reg_phone(message: Message, state: FSMContext):
+    v = message.text.strip()
+    d = await state.get_data()
+    await state.update_data(phone=None if v.lower()=="skip" else v)
+    await state.set_state(SelfRegister.confirm)
+    await message.answer(
+        f"📋 *Confirm*\n\n👤 *{d['full_name']}*\n📞 {v if v.lower()!='skip' else '—'}\n\nSubmit for admin approval?",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=confirm_kb("selfreg"))
+
+@router.callback_query(F.data.startswith("selfreg_"), SelfRegister.confirm)
+async def self_reg_confirm(callback: CallbackQuery, state: FSMContext):
+    if callback.data == "selfreg_no":
+        await state.clear()
+        await callback.message.answer("❌ Cancelled.")
+        await callback.answer(); return
+    d = await state.get_data()
+    uid = callback.from_user.id
+    uname = callback.from_user.username
+    entry = {
+        "telegram_id": uid,
+        "full_name": d["full_name"],
+        "phone": d.get("phone"),
+        "telegram_username": f"@{uname}" if uname else None,
+        "skills": [], "availability": [], "serves": 0,
+    }
+    pending_approvals.append(entry)
+    await callback.message.answer(
+        "✅ *Registration submitted!*\n\nAn admin will review your request. You will be notified when approved. 🙏",
+        parse_mode=ParseMode.MARKDOWN)
+    # Notify admins
+    if bot_instance:
+        await notify_admins(bot_instance,
+            f"🔔 *New Registration Request*\n\n"
+            f"👤 *{d['full_name']}*\n"
+            f"📱 @{uname or '—'}\n"
+            f"🆔 `{uid}`\n\n"
+            f"Use *⏳ Pending Approvals* to review.")
+    await state.clear()
+    await callback.answer()
+
+# ── /help ─────────────────────────────────────────────────────────────────────
 @router.message(Command("help"))
 async def cmd_help(message: Message):
-    text = (
-        "*Available Commands:*\n\n"
-        "👮 *Admin Only:*\n"
-        "/registerbrother — Register a new brother\n"
-        "/editbrother — Edit a brother's info\n"
-        "/deletebrother — Delete a brother\n"
-        "/viewschedule — View this week's schedule\n"
+    await message.answer(
+        "*Commands:*\n\n"
+        "👮 *Admin:*\n"
+        "/registerbrother — Register a brother (admin adds)\n"
+        "/autoschedule — Generate this week's schedule\n"
+        "/viewschedule — View schedule\n"
         "/editschedule — Edit assignments\n"
-        "/approvepending — Review pending registrations\n"
-        "/autoschedule — Auto-generate assignments\n"
+        "/editbrother — Edit brother info\n"
+        "/deletebrother — Remove a brother\n"
+        "/pendingapprovals — Review pending registrations\n"
         "/brotherlist — List all brothers\n"
         "/sendreminders — Send reminders\n"
         "/report — Monthly report\n\n"
         "👤 *Everyone:*\n"
-        "/myassignments — Your upcoming assignments\n"
-        "/availability — Update your availability"
-    )
-    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
+        "/viewschedule — View this week's schedule\n"
+        "/myassignments — Your assignments\n"
+        "/availability — Update availability",
+        parse_mode=ParseMode.MARKDOWN)
 
-# ── Register Brother Flow ─────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# REGISTER BROTHER (admin-initiated)
+# ══════════════════════════════════════════════════════════════════════════════
 @router.message(Command("registerbrother"))
 @router.message(F.text == "➕ Register Brother")
 async def reg_start(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
-        await message.answer("❌ This command is for admins only.")
-        return
+        await message.answer("❌ Admin only."); return
     await state.set_state(RegisterBrother.full_name)
-    await message.answer(
-        "📝 *Register New Brother*\n\nStep 1/2 — Enter their full name:",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    await message.answer("📝 *Register New Brother*\n\nStep 1/5 — Full name:",
+                         parse_mode=ParseMode.MARKDOWN, reply_markup=ReplyKeyboardRemove())
 
 @router.message(RegisterBrother.full_name)
 async def reg_name(message: Message, state: FSMContext):
-    await state.update_data(full_name=message.text.strip())
+    await state.update_data(full_name=message.text.strip(), skills=[], availability=["saturday"])
+    await state.set_state(RegisterBrother.username)
+    await message.answer("Step 2/5 — Telegram username (@username) or *skip*:", parse_mode=ParseMode.MARKDOWN)
+
+@router.message(RegisterBrother.username)
+async def reg_uname(message: Message, state: FSMContext):
+    v = message.text.strip()
+    await state.update_data(telegram_username=None if v.lower()=="skip" else v)
     await state.set_state(RegisterBrother.phone)
-    await message.answer("Step 2/2 — Phone number (e.g. +251911000001) or type *skip*:", parse_mode=ParseMode.MARKDOWN)
+    await message.answer("Step 3/5 — Phone number or *skip*:", parse_mode=ParseMode.MARKDOWN)
 
 @router.message(RegisterBrother.phone)
 async def reg_phone(message: Message, state: FSMContext):
     v = message.text.strip()
-    await state.update_data(phone=None if v.lower() == "skip" else v)
-    await state.set_state(RegisterBrother.confirm)
+    await state.update_data(phone=None if v.lower()=="skip" else v)
+    await state.set_state(RegisterBrother.skills)
+    await message.answer("Step 4/5 — Select skills:", reply_markup=skills_kb())
+
+@router.callback_query(F.data.startswith("skill_"), RegisterBrother.skills)
+async def reg_skill(callback: CallbackQuery, state: FSMContext):
+    skill = callback.data[6:]
+    if skill == "done":
+        d = await state.get_data()
+        if not d.get("skills"):
+            await callback.answer("⚠️ Select at least one skill!", show_alert=True); return
+        await state.set_state(RegisterBrother.availability)
+        await callback.message.answer(
+            f"✅ Skills: *{', '.join(d['skills'])}*\n\nStep 5/5 — Availability:",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=avail_kb())
+        await callback.answer(); return
     d = await state.get_data()
-    text = (
-        f"📋 *Confirm Registration*\n\n"
-        f"👤 Name: *{d['full_name']}*\n"
-        f"📱 Phone: {d.get('phone', '—')}\n\n"
-        f"_Admin will assign skills and availability once approved._"
-    )
-    await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=confirm_kb("reg"))
+    skills = d.get("skills", [])
+    if skill in skills: skills.remove(skill)
+    else: skills.append(skill)
+    await state.update_data(skills=skills)
+    await callback.message.edit_reply_markup(reply_markup=skills_kb(skills))
+    await callback.answer(f"Selected: {', '.join(skills) or 'none'}")
+
+@router.callback_query(F.data.startswith("av_"), RegisterBrother.availability)
+async def reg_avail(callback: CallbackQuery, state: FSMContext):
+    day = callback.data[3:]
+    if day == "done":
+        d = await state.get_data()
+        avail = d.get("availability", ["saturday"])
+        text = (f"📋 *Confirm Registration*\n\n"
+                f"👤 *{d['full_name']}*\n"
+                f"📱 {d.get('telegram_username','—')}  📞 {d.get('phone','—')}\n"
+                f"🎯 {', '.join(d['skills'])}\n"
+                f"📅 {', '.join(avail)}")
+        await state.set_state(RegisterBrother.confirm)
+        await callback.message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=confirm_kb("reg"))
+        await callback.answer(); return
+    d = await state.get_data()
+    avail = d.get("availability", [])
+    if day in avail: avail.remove(day)
+    else: avail.append(day)
+    await state.update_data(availability=avail)
+    await callback.message.edit_reply_markup(reply_markup=avail_kb(avail))
+    await callback.answer(f"Days: {', '.join(avail) or 'none'}")
 
 @router.callback_query(F.data.startswith("reg_"), RegisterBrother.confirm)
 async def reg_confirm(callback: CallbackQuery, state: FSMContext):
     if callback.data == "reg_no":
         await state.clear()
-        await callback.message.answer("❌ Registration cancelled.", reply_markup=admin_menu())
-        await callback.answer()
-        return
-    
+        await callback.message.answer("❌ Cancelled.", reply_markup=admin_menu())
+        await callback.answer(); return
     d = await state.get_data()
-    telegram_id = d.get('telegram_id', callback.from_user.id)
-    
-    # Add brother to pending approvals
-    brother_info = {
-        'telegram_id': telegram_id,
-        'full_name': d['full_name'],
-        'skills': [],
-        'availability': [],
-        'phone': d.get('phone'),
-        'telegram_username': None,
-        'serves': 0,
-        'status': 'pending',
+    # Use a placeholder ID since admin is registering on behalf of someone
+    # Real telegram_id will be linked when the brother sends /start
+    import random
+    fake_id = -(random.randint(100000, 999999))  # negative = not yet linked
+    brothers_db[fake_id] = {
+        "telegram_id": fake_id,
+        "full_name": d["full_name"],
+        "skills": d.get("skills", []),
+        "availability": d.get("availability", ["saturday"]),
+        "phone": d.get("phone"),
+        "telegram_username": d.get("telegram_username"),
+        "serves": 0,
+        "linked": False,   # will be True once they /start the bot
     }
-    pending_approvals.append(brother_info)
-    
     await callback.message.answer(
-        f"✅ *{d['full_name']}* registration submitted!\n\n"
-        f"⏳ Awaiting admin approval. You will be notified once approved.",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    
-    logger.info(f"New registration pending: {d['full_name']} (Telegram ID: {telegram_id})")
-    
+        f"✅ *{d['full_name']}* registered!\n\n"
+        f"Ask them to open the bot and send /start — they will be linked automatically.",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=admin_menu())
     await state.clear()
     await callback.answer()
 
-# ── View Schedule ──────────────────────────────────────────────────────────────
-@router.message(Command("viewschedule"))
-@router.message(F.text.in_({"📋 View Schedule", "📋 This Week's Schedule"}))
-async def cmd_view_schedule(message: Message):
-    today = date.today()
-    saturday = today + timedelta(days=(5 - today.weekday()) % 7)
-    
-    # Convert telegram IDs to full names
-    stage_id = assignments_db.get('stage')
-    stage = brothers_db.get(stage_id, {}).get('full_name') if stage_id else None
-    stage = stage or '—'
-    
-    mic_ids = assignments_db.get('microphone', [])
-    mic_names = [brothers_db.get(mid, {}).get('full_name') for mid in mic_ids if mid in brothers_db]
-    mic = ', '.join(mic_names) if mic_names else '—'
-    
-    audio_id = assignments_db.get('audio')
-    audio = brothers_db.get(audio_id, {}).get('full_name') if audio_id else None
-    audio = audio or '—'
-    
-    video_id = assignments_db.get('video')
-    video = brothers_db.get(video_id, {}).get('full_name') if video_id else None
-    video = video or '—'
-    
-    text = (
-        f"📅 *Saturday Service*\n"
-        f"🗓 {saturday.strftime('%B %d, %Y')}  ⏰ 3:00 PM\n\n"
-        f"👥 *Assignments:*\n"
-        f"🎭 *Stage*: {stage}\n"
-        f"🎤 *Microphone*: {mic}\n"
-        f"🔊 *Audio*: {audio}\n"
-        f"🎥 *Video*: {video}"
-    )
-    if is_admin(message.from_user.id):
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✅ Approve",    callback_data="approve_schedule"),
-            InlineKeyboardButton(text="⚡ Regenerate", callback_data="regen_schedule"),
-        ]])
-        await message.answer(text + "\n\n📌 *Status: Pending Approval*", parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
-    else:
-        await message.answer(text, parse_mode=ParseMode.MARKDOWN)
-
-# ── Auto Schedule ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# AUTO-SCHEDULE  ← FIXED: uses only registered brothers, real date
+# ══════════════════════════════════════════════════════════════════════════════
 @router.message(Command("autoschedule"))
 @router.message(F.text == "⚡ Auto-Schedule")
-async def cmd_auto_start(message: Message, state: FSMContext):
+async def cmd_auto(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
-        await message.answer("❌ This command is for admins only.")
-        return
-    await state.set_state(AutoScheduleFlow.waiting_date)
-    await message.answer(
-        "📅 Enter the program date in this format:\n*YYYY-MM-DD*\n\nExample: 2026-06-14",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=ReplyKeyboardRemove(),
-    )
+        await message.answer("❌ Admin only."); return
 
-@router.message(AutoScheduleFlow.waiting_date)
-async def cmd_auto_run(message: Message, state: FSMContext):
-    try:
-        prog_date = date.fromisoformat(message.text.strip())
-    except ValueError:
-        await message.answer("❌ Invalid format. Please use YYYY-MM-DD\nExample: 2025-06-14")
+    # ── Check we have brothers ───────────────────────────────────────────────
+    active = {tid: b for tid, b in brothers_db.items() if tid > 0}   # skip unlinked placeholders
+    if not active:
+        await message.answer(
+            "❌ *No linked brothers found.*\n\n"
+            "Brothers must send /start to the bot first so they are linked.\n"
+            "Then their real Telegram ID is available for scheduling.",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=admin_menu())
         return
-    await message.answer("⚙️ Generating fair schedule... please wait.")
-    result = (
-        f"✅ *Schedule Generated!*\n\n"
-        f"📅 {prog_date.strftime('%A, %B %d %Y')}\n\n"
-        f"🎭 *Stage*: Michael A. _(8 serves, 3 wks rest)_\n"
-        f"🎤 *Mic*: Grace T., Lydia H.\n"
-        f"🔊 *Audio*: Joseph A. _(3 serves ⭐)_\n"
-        f"🎥 *Video*: Mark L. _(4 serves ⭐)_\n\n"
-        f"⚖️ Fairness Score: *96%*\n"
-        f"✅ No conflicts detected"
-    )
+
+    # ── Use this week's Saturday automatically ───────────────────────────────
+    prog_date = get_next_saturday()
+    wl = week_label(prog_date)
+
+    await message.answer(f"⚙️ Generating schedule for *{wl}* ({prog_date.strftime('%B %d, %Y')})…",
+                         parse_mode=ParseMode.MARKDOWN)
+
+    SECTIONS = [
+        ("stage",      1),
+        ("microphone", 2),
+        ("audio",      1),
+        ("video",      1),
+    ]
+
+    # Sort by fewest serves = fairest rotation
+    pool = sorted(active.values(), key=lambda b: b["serves"])
+    pool_ids = [b["telegram_id"] for b in pool]
+
+    assignments: dict[str, list] = {}
+    assigned_set: set = set()
+    warnings: list = []
+
+    for section, needed in SECTIONS:
+        # Prefer brothers who have this skill
+        skilled = [tid for tid in pool_ids
+                   if tid not in assigned_set and section in brothers_db[tid].get("skills", [])]
+        # Fallback: any unassigned brother
+        any_avail = [tid for tid in pool_ids if tid not in assigned_set]
+
+        chosen = skilled[:needed]
+        if len(chosen) < needed:
+            warnings.append(f"⚠️ Not enough brothers with *{section}* skill (need {needed}, have {len(skilled)}). Using available brothers as fallback.")
+            extras = [tid for tid in any_avail if tid not in chosen]
+            chosen += extras[:needed - len(chosen)]
+
+        assignments[section] = chosen
+        assigned_set.update(chosen)
+
+    # Save the schedule
+    schedule_db.clear()
+    schedule_db.update({
+        "program_date": prog_date.strftime("%B %d, %Y"),
+        "prog_date_iso": prog_date.isoformat(),
+        "week_label": wl,
+        "assignments": assignments,
+        "approved": False,
+    })
+
+    # Build result message using REAL brother names
+    icons = {"stage":"🎭","microphone":"🎤","audio":"🔊","video":"🎥"}
+    result = f"✅ *Schedule Generated!*\n\n📅 {wl}\n🗓 {prog_date.strftime('%A, %B %d %Y')}\n\n"
+
+    all_assigned = True
+    for section, needed in SECTIONS:
+        ids = assignments.get(section, [])
+        names = [brothers_db[tid]["full_name"] for tid in ids if tid in brothers_db]
+        if len(names) < needed:
+            all_assigned = False
+        value = ", ".join(names) if names else "❌ *Not enough brothers*"
+        result += f"{icons[section]} *{section.capitalize()}*: {value}\n"
+
+    result += f"\n👥 Brothers from registry: *{len(active)}*"
+    result += f"\n📊 Assigned: *{len(assigned_set)}/{len(active)}* brothers"
+
+    if warnings:
+        result += "\n\n" + "\n".join(warnings)
+
+    if not all_assigned:
+        result += "\n\n⚠️ *Some sections are understaffed. Register more brothers.*"
+
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="💾 Save & Notify Brothers", callback_data=f"save_{prog_date}"),
+        InlineKeyboardButton(text="💾 Save & Notify Brothers", callback_data="save_schedule"),
         InlineKeyboardButton(text="🔄 Regenerate",             callback_data="regen_schedule"),
     ]])
     await message.answer(result, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
-    await state.clear()
 
-# ── Brother List ───────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# VIEW SCHEDULE  ← FIXED: shows "This Week / Next Week" label
+# ══════════════════════════════════════════════════════════════════════════════
+@router.message(Command("viewschedule"))
+@router.message(F.text.in_({"📋 View Schedule","📋 This Week's Schedule"}))
+async def cmd_view_schedule(message: Message):
+    uid = message.from_user.id
+    is_adm = is_admin(uid)
+    text = format_schedule_text(admin=is_adm)
+
+    if is_adm and schedule_db:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Approve & Notify", callback_data="approve_schedule"),
+            InlineKeyboardButton(text="📝 Edit",             callback_data="go_edit_schedule"),
+            InlineKeyboardButton(text="🔄 Regenerate",       callback_data="regen_schedule"),
+        ]])
+        await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    else:
+        await message.answer(text, parse_mode=ParseMode.MARKDOWN)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EDIT SCHEDULE
+# ══════════════════════════════════════════════════════════════════════════════
+@router.message(Command("editschedule"))
+@router.message(F.text == "📝 Edit Schedule")
+async def edit_schedule_start(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Admin only."); return
+    if not schedule_db:
+        await message.answer("⚠️ No schedule yet. Use ⚡ Auto-Schedule first."); return
+    await state.set_state(EditScheduleFlow.choose_section)
+    await message.answer(
+        f"📝 *Edit Schedule — {schedule_db.get('week_label','This Week')}*\n\nChoose section to edit:",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=sections_kb())
+
+@router.callback_query(F.data.startswith("editsec:"), EditScheduleFlow.choose_section)
+async def edit_sec_chosen(callback: CallbackQuery, state: FSMContext):
+    section = callback.data.split(":")[1]
+    if section == "cancel":
+        await state.clear()
+        await callback.message.answer("❌ Cancelled.", reply_markup=admin_menu())
+        await callback.answer(); return
+    await state.update_data(edit_section=section)
+
+    current_ids = schedule_db["assignments"].get(section, [])
+    current_names = [brothers_db[tid]["full_name"] for tid in current_ids if tid in brothers_db]
+
+    rows = []
+    for tid in current_ids:
+        b = brothers_db.get(tid)
+        if b:
+            rows.append([InlineKeyboardButton(
+                text=f"🔄 Replace {b['full_name']}",
+                callback_data=f"editact:replace:{tid}")])
+            rows.append([InlineKeyboardButton(
+                text=f"❌ Remove {b['full_name']}",
+                callback_data=f"editact:remove:{tid}")])
+    rows.append([InlineKeyboardButton(text="➕ Add a brother", callback_data="editact:add:none")])
+    rows.append([InlineKeyboardButton(text="⬅️ Back",          callback_data="editact:back:none")])
+
+    icons = {"stage":"🎭","microphone":"🎤","audio":"🔊","video":"🎥"}
+    await state.set_state(EditScheduleFlow.choose_action)
+    await callback.message.answer(
+        f"{icons.get(section,'•')} *{section.capitalize()}* — currently: "
+        f"{', '.join(current_names) or '(empty)'}\n\nWhat do you want to do?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("editact:"), EditScheduleFlow.choose_action)
+async def edit_action_chosen(callback: CallbackQuery, state: FSMContext):
+    _, action, target = callback.data.split(":", 2)
+    if action == "back":
+        await state.set_state(EditScheduleFlow.choose_section)
+        await callback.message.answer("Choose section:", reply_markup=sections_kb())
+        await callback.answer(); return
+
+    d = await state.get_data()
+    section = d["edit_section"]
+
+    if action == "remove":
+        tid = int(target)
+        ids = schedule_db["assignments"].get(section, [])
+        if tid in ids:
+            ids.remove(tid)
+        name = brothers_db.get(tid, {}).get("full_name", str(tid))
+        await state.clear()
+        await callback.message.answer(
+            f"🗑 *{name}* removed from *{section.capitalize()}*.\n\n" + format_schedule_text(admin=True),
+            parse_mode=ParseMode.MARKDOWN, reply_markup=admin_menu())
+        await callback.answer(); return
+
+    # replace or add → pick new brother
+    await state.update_data(edit_action=action, replacing_tid=int(target) if target != "none" else None)
+    await state.set_state(EditScheduleFlow.choose_new_brother)
+
+    # Exclude already-assigned brothers (except the one being replaced)
+    all_assigned = [tid for s, ids in schedule_db["assignments"].items()
+                    for tid in ids if s != section]
+    await callback.message.answer(
+        f"Choose a brother for *{section.capitalize()}*:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=brothers_list_kb("picknew", exclude_ids=all_assigned))
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("picknew:"), EditScheduleFlow.choose_new_brother)
+async def edit_pick_new(callback: CallbackQuery, state: FSMContext):
+    new_tid = int(callback.data.split(":")[1])
+    d = await state.get_data()
+    section = d["edit_section"]
+    action = d["edit_action"]
+    replacing_tid = d.get("replacing_tid")
+
+    ids = schedule_db["assignments"].setdefault(section, [])
+    if action == "replace" and replacing_tid in ids:
+        idx = ids.index(replacing_tid)
+        ids[idx] = new_tid
+    else:
+        if new_tid not in ids:
+            ids.append(new_tid)
+
+    new_name = brothers_db.get(new_tid, {}).get("full_name", str(new_tid))
+    await state.clear()
+    await callback.message.answer(
+        f"✅ *{new_name}* assigned to *{section.capitalize()}*.\n\n" + format_schedule_text(admin=True),
+        parse_mode=ParseMode.MARKDOWN, reply_markup=admin_menu())
+    await callback.answer()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EDIT BROTHER
+# ══════════════════════════════════════════════════════════════════════════════
+@router.message(Command("editbrother"))
+@router.message(F.text == "✏️ Edit Brother")
+async def edit_bro_start(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Admin only."); return
+    if not brothers_db:
+        await message.answer("⚠️ No brothers registered yet."); return
+    await state.set_state(EditBrotherFlow.choose_brother)
+    await message.answer("✏️ *Edit Brother*\n\nSelect a brother:",
+                         parse_mode=ParseMode.MARKDOWN,
+                         reply_markup=brothers_list_kb("editbro"))
+
+@router.callback_query(F.data.startswith("editbro:"), EditBrotherFlow.choose_brother)
+async def edit_bro_chosen(callback: CallbackQuery, state: FSMContext):
+    tid = int(callback.data.split(":")[1])
+    b = brothers_db.get(tid)
+    if not b:
+        await callback.answer("Brother not found.", show_alert=True); return
+    await state.update_data(editing_tid=tid)
+    await state.set_state(EditBrotherFlow.choose_field)
+    await callback.message.answer(
+        f"✏️ Editing: *{b['full_name']}*\n\n"
+        f"📱 {b.get('telegram_username','—')}  📞 {b.get('phone','—')}\n"
+        f"🎯 Skills: {', '.join(b['skills']) or 'None'}\n"
+        f"📅 Available: {', '.join(b.get('availability',[])) or 'None'}\n\n"
+        f"What to change?",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=edit_fields_kb())
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("ef:"), EditBrotherFlow.choose_field)
+async def edit_field_chosen(callback: CallbackQuery, state: FSMContext):
+    field = callback.data[3:]
+    if field == "cancel":
+        await state.clear()
+        await callback.message.answer("❌ Cancelled.", reply_markup=admin_menu())
+        await callback.answer(); return
+    await state.update_data(edit_field=field)
+    d = await state.get_data()
+    b = brothers_db[d["editing_tid"]]
+    if field == "skills":
+        await state.set_state(EditBrotherFlow.choose_skills)
+        await state.update_data(new_skills=b["skills"].copy())
+        await callback.message.answer("🎯 Update skills:", reply_markup=skills_kb(b["skills"]))
+    elif field == "availability":
+        await state.set_state(EditBrotherFlow.choose_avail)
+        await state.update_data(new_avail=b.get("availability",[]).copy())
+        await callback.message.answer("📅 Update availability:", reply_markup=avail_kb(b.get("availability",[])))
+    else:
+        await state.set_state(EditBrotherFlow.enter_value)
+        labels = {"full_name":"Full Name","username":"Telegram Username","phone":"Phone"}
+        current = b.get(field if field!="username" else "telegram_username", "—")
+        await callback.message.answer(
+            f"Enter new *{labels.get(field,field)}* (current: {current}):",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=ReplyKeyboardRemove())
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("skill_"), EditBrotherFlow.choose_skills)
+async def edit_bro_skill(callback: CallbackQuery, state: FSMContext):
+    skill = callback.data[6:]
+    d = await state.get_data()
+    skills = d.get("new_skills", [])
+    if skill == "done":
+        if not skills:
+            await callback.answer("⚠️ Select at least one!", show_alert=True); return
+        brothers_db[d["editing_tid"]]["skills"] = skills
+        await state.clear()
+        await callback.message.answer(f"✅ Skills updated: *{', '.join(skills)}*",
+                                      parse_mode=ParseMode.MARKDOWN, reply_markup=admin_menu())
+        await callback.answer(); return
+    if skill in skills: skills.remove(skill)
+    else: skills.append(skill)
+    await state.update_data(new_skills=skills)
+    await callback.message.edit_reply_markup(reply_markup=skills_kb(skills))
+    await callback.answer(f"Selected: {', '.join(skills) or 'none'}")
+
+@router.callback_query(F.data.startswith("av_"), EditBrotherFlow.choose_avail)
+async def edit_bro_avail(callback: CallbackQuery, state: FSMContext):
+    day = callback.data[3:]
+    d = await state.get_data()
+    avail = d.get("new_avail", [])
+    if day == "done":
+        brothers_db[d["editing_tid"]]["availability"] = avail
+        await state.clear()
+        await callback.message.answer(f"✅ Availability updated: *{', '.join(avail) or 'None'}*",
+                                      parse_mode=ParseMode.MARKDOWN, reply_markup=admin_menu())
+        await callback.answer(); return
+    if day in avail: avail.remove(day)
+    else: avail.append(day)
+    await state.update_data(new_avail=avail)
+    await callback.message.edit_reply_markup(reply_markup=avail_kb(avail))
+    await callback.answer(f"Days: {', '.join(avail) or 'none'}")
+
+@router.message(EditBrotherFlow.enter_value)
+async def edit_bro_value(message: Message, state: FSMContext):
+    d = await state.get_data()
+    field = d["edit_field"]
+    tid = d["editing_tid"]
+    val = message.text.strip()
+    if field == "full_name":
+        brothers_db[tid]["full_name"] = val
+    elif field == "username":
+        brothers_db[tid]["telegram_username"] = val
+    elif field == "phone":
+        brothers_db[tid]["phone"] = val if val.lower()!="skip" else None
+    await state.clear()
+    await message.answer(f"✅ Updated successfully!", reply_markup=admin_menu())
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DELETE BROTHER
+# ══════════════════════════════════════════════════════════════════════════════
+@router.message(Command("deletebrother"))
+@router.message(F.text == "🗑 Delete Brother")
+async def del_bro_start(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Admin only."); return
+    if not brothers_db:
+        await message.answer("⚠️ No brothers registered."); return
+    await state.set_state(DeleteBrotherFlow.choose_brother)
+    await message.answer("🗑 *Delete Brother*\n\nSelect a brother to remove:",
+                         parse_mode=ParseMode.MARKDOWN,
+                         reply_markup=brothers_list_kb("delbro"))
+
+@router.callback_query(F.data.startswith("delbro:"), DeleteBrotherFlow.choose_brother)
+async def del_bro_chosen(callback: CallbackQuery, state: FSMContext):
+    tid = int(callback.data.split(":")[1])
+    b = brothers_db.get(tid)
+    if not b:
+        await callback.answer("Not found.", show_alert=True); return
+    await state.update_data(deleting_tid=tid)
+    await state.set_state(DeleteBrotherFlow.confirm)
+    await callback.message.answer(
+        f"⚠️ *Confirm Delete*\n\n"
+        f"👤 *{b['full_name']}*\n"
+        f"🎯 Skills: {', '.join(b['skills']) or 'None'}\n"
+        f"📊 Serves: {b['serves']}\n\n"
+        f"This cannot be undone!",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=confirm_kb("del"))
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("del_"), DeleteBrotherFlow.confirm)
+async def del_bro_confirm(callback: CallbackQuery, state: FSMContext):
+    if callback.data == "del_no":
+        await state.clear()
+        await callback.message.answer("❌ Cancelled.", reply_markup=admin_menu())
+        await callback.answer(); return
+    d = await state.get_data()
+    tid = d["deleting_tid"]
+    name = brothers_db.get(tid, {}).get("full_name", "Unknown")
+    brothers_db.pop(tid, None)
+    # Also remove from schedule if present
+    for ids in schedule_db.get("assignments", {}).values():
+        if tid in ids:
+            ids.remove(tid)
+    await state.clear()
+    await callback.message.answer(f"🗑 *{name}* deleted from the system.",
+                                  parse_mode=ParseMode.MARKDOWN, reply_markup=admin_menu())
+    await callback.answer()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PENDING APPROVALS
+# ══════════════════════════════════════════════════════════════════════════════
+@router.message(Command("pendingapprovals"))
+@router.message(F.text == "⏳ Pending Approvals")
+async def cmd_pending(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Admin only."); return
+    if not pending_approvals:
+        await message.answer("✅ No pending approvals.", reply_markup=admin_menu()); return
+
+    text = f"⏳ *Pending Approvals ({len(pending_approvals)})*\n\n"
+    buttons = []
+    for p in pending_approvals:
+        text += (f"👤 *{p['full_name']}*\n"
+                 f"   📱 {p.get('telegram_username','—')}  📞 {p.get('phone','—')}\n"
+                 f"   🆔 `{p['telegram_id']}`\n\n")
+        buttons.append([
+            InlineKeyboardButton(text=f"✅ Approve {p['full_name'].split()[0]}",
+                                 callback_data=f"papprove:{p['telegram_id']}"),
+            InlineKeyboardButton(text="❌ Reject",
+                                 callback_data=f"preject:{p['telegram_id']}"),
+        ])
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN,
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+@router.callback_query(F.data.startswith("papprove:"))
+async def cb_papprove(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Admin only", show_alert=True); return
+    tid = int(callback.data.split(":")[1])
+    entry = next((p for p in pending_approvals if p["telegram_id"]==tid), None)
+    if not entry:
+        await callback.answer("Already handled.", show_alert=True); return
+    pending_approvals.remove(entry)
+    brothers_db[tid] = {**entry, "linked": True}
+    # Notify brother
+    if bot_instance:
+        try:
+            await bot_instance.send_message(
+                tid,
+                f"🎉 *Registration Approved!*\n\n"
+                f"Welcome, *{entry['full_name']}*! 🙏\n\n"
+                f"You can now view your assignments and schedule.",
+                parse_mode=ParseMode.MARKDOWN, reply_markup=brother_menu())
+        except Exception as e:
+            logger.warning("Could not notify approved user %s: %s", tid, e)
+    await callback.message.answer(
+        f"✅ *{entry['full_name']}* approved and added to the registry!",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=admin_menu())
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("preject:"))
+async def cb_preject(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Admin only", show_alert=True); return
+    tid = int(callback.data.split(":")[1])
+    entry = next((p for p in pending_approvals if p["telegram_id"]==tid), None)
+    if not entry:
+        await callback.answer("Already handled.", show_alert=True); return
+    pending_approvals.remove(entry)
+    if bot_instance:
+        try:
+            await bot_instance.send_message(
+                tid,
+                "❌ *Your registration was not approved.*\n\nPlease contact the department admin.")
+        except Exception as e:
+            logger.warning("Could not notify rejected user %s: %s", tid, e)
+    await callback.message.answer(
+        f"❌ *{entry['full_name']}* rejected.",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=admin_menu())
+    await callback.answer()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BROTHER LIST / MY ASSIGNMENTS / AVAILABILITY / REPORT / REMINDERS
+# ══════════════════════════════════════════════════════════════════════════════
 @router.message(Command("brotherlist"))
 @router.message(F.text == "👥 Brother List")
 async def cmd_brother_list(message: Message):
     if not is_admin(message.from_user.id):
-        await message.answer("❌ This command is for admins only.")
-        return
-    
+        await message.answer("❌ Admin only."); return
     if not brothers_db:
-        await message.answer("👥 *Brothers Registry*\n\nNo brothers registered yet.", parse_mode=ParseMode.MARKDOWN)
-        return
-    
+        await message.answer("👥 No brothers registered yet."); return
     text = "👥 *Brothers Registry*\n\n"
-    for name, brother in brothers_db.items():
-        skills_str = ', '.join(brother['skills']) if brother['skills'] else 'None'
-        text += f"🟢 *{brother['full_name']}* — {skills_str} — {brother['serves']} serves\n"
-    
+    for b in sorted(brothers_db.values(), key=lambda x: x["full_name"]):
+        linked = "🟢" if b.get("linked", b["telegram_id"]>0) else "🟡"
+        text += f"{linked} *{b['full_name']}* — {', '.join(b['skills']) or 'No skills'} — {b['serves']} serves\n"
+    text += "\n🟢 Linked (active)  🟡 Not yet linked to bot"
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
-# ── Edit Brother ───────────────────────────────────────────────────────────────
-@router.message(Command("editbrother"))
-@router.message(F.text == "✏️ Edit Brother")
-async def cmd_edit_start(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ This command is for admins only.")
-        return
-    
-    if not brothers_db:
-        await message.answer("❌ No brothers registered to edit.", reply_markup=admin_menu())
-        return
-    
-    await state.set_state(EditBrother.choosing_brother)
-    # Create inline keyboard with registered brother options
-    kb_buttons = [
-        [InlineKeyboardButton(text=f"✏️ {brothers_db[tid]['full_name']}", callback_data=f"edit_{i}")]
-        for i, tid in enumerate(brothers_db.keys())
-    ]
-    kb_buttons.append([InlineKeyboardButton(text="❌ Cancel", callback_data="edit_cancel")])
-    kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
-    
-    await message.answer(
-        "✏️ *Edit Brother*\n\nSelect a brother to edit:",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb,
-    )
-
-@router.callback_query(F.data.startswith("edit_"), EditBrother.choosing_brother)
-async def edit_select_brother(callback: CallbackQuery, state: FSMContext):
-    if callback.data == "edit_cancel":
-        await state.clear()
-        await callback.message.answer("❌ Edit cancelled.", reply_markup=admin_menu())
-        await callback.answer()
-        return
-    
-    # Get brother by index from telegram_ids
-    try:
-        idx = int(callback.data[5:])
-        telegram_id = list(brothers_db.keys())[idx]
-        brother_name = brothers_db[telegram_id]['full_name']
-    except (ValueError, IndexError):
-        await callback.answer("❌ Invalid selection", show_alert=True)
-        return
-    
-    await state.update_data(telegram_id=telegram_id, brother_name=brother_name)
-    await state.set_state(EditBrother.choosing_field)
-    
-    # Show options for what to edit
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎯 Skills", callback_data="edit_field_skills")],
-        [InlineKeyboardButton(text="📅 Availability", callback_data="edit_field_availability")],
-        [InlineKeyboardButton(text="📱 Phone", callback_data="edit_field_phone")],
-        [InlineKeyboardButton(text="👤 Telegram Username", callback_data="edit_field_username")],
-        [InlineKeyboardButton(text="❌ Cancel", callback_data="edit_cancel")],
-    ])
-    
-    await callback.message.answer(
-        f"✏️ *Edit {brother_name}*\n\nWhat would you like to edit?",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb,
-    )
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("edit_field_"), EditBrother.choosing_field)
-async def edit_choose_field(callback: CallbackQuery, state: FSMContext):
-    if callback.data == "edit_cancel":
-        await state.clear()
-        await callback.message.answer("❌ Edit cancelled.", reply_markup=admin_menu())
-        await callback.answer()
-        return
-    
-    field = callback.data[11:]
-    d = await state.get_data()
-    telegram_id = d.get("telegram_id")
-    brother_name = d.get("brother_name")
-    brother = brothers_db.get(telegram_id, {})
-    
-    await state.update_data(editing_field=field)
-    await state.set_state(EditBrother.editing_value)
-    
-    if field == "skills":
-        await callback.message.answer(
-            "🎯 *Edit Skills*\n\nSelect skills (tap all that apply, then Done):",
-            reply_markup=skills_kb(),
-        )
-    elif field == "availability":
-        await callback.message.answer(
-            "📅 *Edit Availability*\n\nSelect days (tap to toggle, then Save):",
-            reply_markup=avail_kb(),
-        )
-    elif field == "phone":
-        current = brother.get('phone') or 'None'
-        await callback.message.answer(
-            f"📱 *Edit Phone*\n\nCurrent: {current}\n\nEnter new phone number or type *skip*:",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    elif field == "username":
-        current = brother.get('telegram_username') or 'None'
-        await callback.message.answer(
-            f"👤 *Edit Telegram Username*\n\nCurrent: {current}\n\nEnter new username (e.g. @username) or type *skip*:",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("skill_"), EditBrother.editing_value)
-async def edit_skill(callback: CallbackQuery, state: FSMContext):
-    if callback.data == "skill_done":
-        d = await state.get_data()
-        if not d.get("skills"):
-            await callback.answer("⚠️ Please select at least one skill!", show_alert=True)
-            return
-        await state.set_state(EditBrother.confirm_edit)
-        brother_name = d.get("brother_name")
-        await callback.message.answer(
-            f"✅ Skills: *{', '.join(d['skills'])}*\n\n📋 *Confirm changes for {brother_name}?*",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=confirm_kb("edit_confirm"),
-        )
-        await callback.answer()
-        return
-    
-    skill = callback.data[6:]
-    d = await state.get_data()
-    skills = d.get("skills", [])
-    if skill in skills:
-        skills.remove(skill)
-    else:
-        skills.append(skill)
-    await state.update_data(skills=skills)
-    await callback.answer(f"Selected: {', '.join(skills) or 'none'}")
-
-@router.callback_query(F.data.startswith("av_"), EditBrother.editing_value)
-async def edit_avail(callback: CallbackQuery, state: FSMContext):
-    day = callback.data[3:]
-    if day == "done":
-        d = await state.get_data()
-        avail = d.get("availability", ["saturday"])
-        await state.set_state(EditBrother.confirm_edit)
-        brother_name = d.get("brother_name")
-        await callback.message.answer(
-            f"✅ Availability: *{', '.join(avail)}*\n\n📋 *Confirm changes for {brother_name}?*",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=confirm_kb("edit_confirm"),
-        )
-        await callback.answer()
-        return
-    
-    d = await state.get_data()
-    avail = d.get("availability", [])
-    if day in avail:
-        avail.remove(day)
-    else:
-        avail.append(day)
-    await state.update_data(availability=avail)
-    await callback.answer(f"Days: {', '.join(avail) or 'none'}")
-
-@router.message(EditBrother.editing_value)
-async def edit_text_field(message: Message, state: FSMContext):
-    d = await state.get_data()
-    field = d.get("editing_field")
-    
-    if field == "phone":
-        v = message.text.strip()
-        await state.update_data(phone=None if v.lower() == "skip" else v)
-    elif field == "username":
-        v = message.text.strip()
-        await state.update_data(telegram_username=None if v.lower() == "skip" else v)
-    
-    await state.set_state(EditBrother.confirm_edit)
-    brother_name = d.get("brother_name")
-    new_val = message.text.strip() if message.text.strip().lower() != "skip" else "—"
-    await message.answer(
-        f"✅ {field.title()}: *{new_val}*\n\n📋 *Confirm changes for {brother_name}?*",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=confirm_kb("edit_confirm"),
-    )
-
-@router.callback_query(F.data.startswith("edit_confirm_"), EditBrother.confirm_edit)
-async def edit_confirm(callback: CallbackQuery, state: FSMContext):
-    if callback.data == "edit_confirm_no":
-        await state.clear()
-        await callback.message.answer("❌ Edit cancelled.", reply_markup=admin_menu())
-        await callback.answer()
-        return
-    
-    d = await state.get_data()
-    telegram_id = d.get("telegram_id")
-    brother_name = d.get("brother_name")
-    field = d.get("editing_field")
-    
-    # Update the brother record
-    if telegram_id in brothers_db:
-        if field == "skills":
-            brothers_db[telegram_id]['skills'] = d.get('skills', [])
-        elif field == "availability":
-            brothers_db[telegram_id]['availability'] = d.get('availability', ["saturday"])
-        elif field == "phone":
-            brothers_db[telegram_id]['phone'] = d.get('phone')
-        elif field == "username":
-            brothers_db[telegram_id]['telegram_username'] = d.get('telegram_username')
-    
-    await callback.message.answer(
-        f"✅ *{brother_name}* has been updated successfully!",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=admin_menu(),
-    )
-    await state.clear()
-    await callback.answer()
-
-# ── Delete Brother ─────────────────────────────────────────────────────────────
-@router.message(Command("deletebrother"))
-@router.message(F.text == "🗑️ Delete Brother")
-async def cmd_delete_start(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ This command is for admins only.")
-        return
-    
-    if not brothers_db:
-        await message.answer("❌ No brothers registered to delete.", reply_markup=admin_menu())
-        return
-    
-    await state.set_state(DeleteBrother.choosing_brother)
-    # Create inline keyboard with registered brother options
-    kb_buttons = [
-        [InlineKeyboardButton(text=f"🗑️ {brothers_db[tid]['full_name']}", callback_data=f"del_{i}")]
-        for i, tid in enumerate(brothers_db.keys())
-    ]
-    kb_buttons.append([InlineKeyboardButton(text="❌ Cancel", callback_data="del_cancel")])
-    kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
-    
-    await message.answer(
-        "🗑️ *Delete Brother*\n\nSelect a brother to delete:",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb,
-    )
-
-@router.callback_query((F.data.startswith("del_") & ~F.data.startswith("del_confirm_")) & ~F.data.in_(["del_cancel"]), DeleteBrother.choosing_brother)
-async def del_select_brother(callback: CallbackQuery, state: FSMContext):
-    if callback.data == "del_cancel":
-        await state.clear()
-        await callback.message.answer("❌ Deletion cancelled.", reply_markup=admin_menu())
-        await callback.answer()
-        return
-    
-    # Only handle non-confirm callbacks here
-    if "confirm" in callback.data:
-        return
-    
-    # Get telegram_id from index
-    try:
-        idx = int(callback.data[4:])
-        telegram_id = list(brothers_db.keys())[idx]
-        brother_name = brothers_db[telegram_id]['full_name']
-    except (ValueError, IndexError):
-        await callback.answer("❌ Invalid selection", show_alert=True)
-        return
-    
-    await state.update_data(telegram_id=telegram_id, brother_name=brother_name)
-    await state.set_state(DeleteBrother.confirm_delete)
-    
-    kb = confirm_kb("del_confirm")
-    await callback.message.answer(
-        f"⚠️ *Confirm Deletion*\n\n"
-        f"Are you sure you want to delete *{brother_name}* from the registry?\n\n"
-        f"This action cannot be undone.",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb,
-    )
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("del_confirm_"), DeleteBrother.confirm_delete)
-async def del_confirm(callback: CallbackQuery, state: FSMContext):
-    if callback.data == "del_confirm_no":
-        await state.clear()
-        await callback.message.answer("❌ Deletion cancelled.", reply_markup=admin_menu())
-        await callback.answer()
-        return
-    
-    d = await state.get_data()
-    telegram_id = d.get("telegram_id")
-    brother_name = d.get("brother_name")
-    
-    # Delete from storage
-    if telegram_id in brothers_db:
-        del brothers_db[telegram_id]
-    
-    await callback.message.answer(
-        f"✅ *{brother_name}* has been successfully deleted from the registry!\n\n"
-        f"Their assignments have been marked as unassigned.",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=admin_menu(),
-    )
-    await state.clear()
-    await callback.answer()
-
-# ── Edit Schedule ──────────────────────────────────────────────────────────────
-@router.message(Command("editschedule"))
-@router.message(F.text == "✏️ Edit Schedule")
-async def cmd_edit_schedule(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ This command is for admins only.")
-        return
-    
-    await state.set_state(EditSchedule.choosing_role)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎭 Stage", callback_data="sched_role_stage")],
-        [InlineKeyboardButton(text="🎤 Microphone", callback_data="sched_role_microphone")],
-        [InlineKeyboardButton(text="🔊 Audio", callback_data="sched_role_audio")],
-        [InlineKeyboardButton(text="🎥 Video", callback_data="sched_role_video")],
-        [InlineKeyboardButton(text="❌ Cancel", callback_data="sched_cancel")],
-    ])
-    
-    await message.answer(
-        "✏️ *Edit Schedule*\n\nSelect a role to edit:",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb,
-    )
-
-@router.callback_query(F.data.startswith("sched_role_"), EditSchedule.choosing_role)
-async def sched_choose_role(callback: CallbackQuery, state: FSMContext):
-    if callback.data == "sched_cancel":
-        await state.clear()
-        await callback.message.answer("❌ Edit cancelled.", reply_markup=admin_menu())
-        await callback.answer()
-        return
-    
-    role = callback.data[11:]
-    await state.update_data(role=role)
-    await state.set_state(EditSchedule.choosing_brother)
-    
-    kb_buttons = [
-        [InlineKeyboardButton(text=f"✅ {brothers_db[tid]['full_name']}", callback_data=f"sched_brother_{i}")]
-        for i, tid in enumerate(brothers_db.keys())
-    ]
-    kb_buttons.append([InlineKeyboardButton(text="❌ None", callback_data="sched_brother_none")])
-    kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
-    
-    await callback.message.answer(
-        f"✏️ *Edit {role.title()}*\n\nSelect brother to assign:",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb,
-    )
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("sched_brother_"), EditSchedule.choosing_brother)
-async def sched_choose_brother(callback: CallbackQuery, state: FSMContext):
-    d = await state.get_data()
-    role = d.get("role")
-    
-    if callback.data == "sched_brother_none":
-        telegram_id = None
-        chosen_text = "None"
-    else:
-        try:
-            idx = int(callback.data[14:])
-            telegram_id = list(brothers_db.keys())[idx]
-            chosen_text = brothers_db[telegram_id]['full_name']
-        except (ValueError, IndexError):
-            await callback.answer("❌ Invalid selection", show_alert=True)
-            return
-    
-    await state.update_data(chosen_brother=telegram_id)
-    await state.set_state(EditSchedule.confirm_edit)
-    
-    kb = confirm_kb("sched_confirm")
-    await callback.message.answer(
-        f"📋 *Confirm Assignment*\n\n"
-        f"Role: *{role.title()}*\n"
-        f"Assigned: *{chosen_text}*",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb,
-    )
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("sched_confirm_"), EditSchedule.confirm_edit)
-async def sched_confirm(callback: CallbackQuery, state: FSMContext):
-    if callback.data == "sched_confirm_no":
-        await state.clear()
-        await callback.message.answer("❌ Edit cancelled.", reply_markup=admin_menu())
-        await callback.answer()
-        return
-    
-    d = await state.get_data()
-    role = d.get("role")
-    brother_id = d.get("chosen_brother")
-    
-    # Update assignment
-    if role in ["stage", "audio", "video"]:
-        assignments_db[role] = brother_id
-    elif role == "microphone":
-        if brother_id:
-            assignments_db["microphone"] = [brother_id] if brother_id not in assignments_db["microphone"] else assignments_db["microphone"]
-    
-    # Get brother name for display
-    brother_name = "None"
-    if brother_id and brother_id in brothers_db:
-        brother_name = brothers_db[brother_id]['full_name']
-    
-    await callback.message.answer(
-        f"✅ *{role.title()}* assigned to *{brother_name}*!\n\nNotification sent.",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=admin_menu(),
-    )
-    
-    # Send notification to assigned brother
-    if brother_id and brother_id in brothers_db:
-        today = date.today()
-        saturday = today + timedelta(days=(5 - today.weekday()) % 7)
-        notification = (
-            f"📢 *Schedule Update*\n\n"
-            f"You have been assigned to:\n"
-            f"🎯 *Role*: {role.title()}\n"
-            f"📅 *Date*: {saturday.strftime('%A, %B %d, %Y')}\n"
-            f"⏰ *Time*: 3:00 PM\n\n"
-            f"Please confirm your availability using the buttons below."
-        )
-        kb = assign_kb(f"{brother_id}_{role}")
-        if bot_instance:
-            try:
-                await bot_instance.send_message(brother_id, notification, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
-                logger.info(f"Schedule notification sent to {brother_name} ({brother_id}) for {role}")
-            except Exception as e:
-                logger.error(f"Failed to send schedule notification to {brother_id}: {e}")
-    
-    await state.clear()
-    await callback.answer()
-
-# ── Pending Approval ───────────────────────────────────────────────────────────
-@router.message(Command("approvepending"))
-@router.message(F.text == "⏳ Pending Approval")
-async def cmd_pending_approval(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ This command is for admins only.")
-        return
-    
-    if not pending_approvals:
-        await message.answer("✅ No pending registrations.", reply_markup=admin_menu())
-        return
-    
-    await state.set_state(PendingApproval.approving)
-    
-    # Show first pending brother
-    brother = pending_approvals[0]
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Approve", callback_data="pending_approve")],
-        [InlineKeyboardButton(text="❌ Reject", callback_data="pending_reject")],
-    ])
-    
-    text = (
-        f"⏳ *Pending Registration Review*\n\n"
-        f"👤 Name: *{brother['full_name']}*\n"
-        f"📱 Phone: {brother.get('phone', '—')}\n\n"
-        f"_Skills and availability will be assigned after approval._\n\n"
-        f"📊 Pending: {len(pending_approvals)} registration(s)"
-    )
-    
-    await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
-
-@router.callback_query(F.data == "pending_approve", PendingApproval.approving)
-async def pending_approve(callback: CallbackQuery, state: FSMContext):
-    if not pending_approvals:
-        await callback.answer("No pending approvals")
-        return
-    
-    brother = pending_approvals.pop(0)
-    telegram_id = brother['telegram_id']
-    
-    # Save to brothers_db using telegram_id as key
-    brothers_db[telegram_id] = {
-        'telegram_id': telegram_id,
-        'full_name': brother['full_name'],
-        'skills': brother['skills'],
-        'availability': brother['availability'],
-        'phone': brother.get('phone'),
-        'telegram_username': brother.get('telegram_username'),
-        'serves': 0,
-    }
-    
-    await callback.message.answer(
-        f"✅ *{brother['full_name']}* has been approved and added to the registry!",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=admin_menu(),
-    )
-    
-    # Send approval notification to the brother
-    approval_msg = (
-        f"🎉 *Registration Approved!*\n\n"
-        f"Welcome, *{brother['full_name']}*!\n\n"
-        f"Your registration with the A/V Department has been approved. "
-        f"You can now use the /myassignments command to view your assignments and "
-        f"the /availability command to set your availability.\n\n"
-        f"Thank you for serving! 🙏"
-    )
-    if bot_instance:
-        try:
-            await bot_instance.send_message(telegram_id, approval_msg, parse_mode=ParseMode.MARKDOWN, reply_markup=brother_menu())
-            logger.info(f"Approval notification sent to {brother['full_name']} ({telegram_id})")
-        except Exception as e:
-            logger.error(f"Failed to send approval notification to {telegram_id}: {e}")
-    
-    if pending_approvals:
-        brother = pending_approvals[0]
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Approve", callback_data="pending_approve")],
-            [InlineKeyboardButton(text="❌ Reject", callback_data="pending_reject")],
-        ])
-        text = (
-            f"⏳ *Next Pending Registration*\n\n"
-            f"👤 Name: *{brother['full_name']}*\n"
-            f"📱 Phone: {brother.get('phone', '—')}\n\n"
-            f"_Skills and availability will be assigned after approval._\n\n"
-            f"📊 Remaining: {len(pending_approvals)}"
-        )
-        await callback.message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
-    else:
-        await state.clear()
-    
-    await callback.answer()
-
-@router.callback_query(F.data == "pending_reject", PendingApproval.approving)
-async def pending_reject(callback: CallbackQuery, state: FSMContext):
-    if not pending_approvals:
-        await callback.answer("No pending approvals")
-        return
-    
-    brother = pending_approvals.pop(0)
-    
-    await callback.message.answer(
-        f"❌ *{brother['full_name']}* registration has been rejected.",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=admin_menu(),
-    )
-    
-    if pending_approvals:
-        brother = pending_approvals[0]
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Approve", callback_data="pending_approve")],
-            [InlineKeyboardButton(text="❌ Reject", callback_data="pending_reject")],
-        ])
-        text = (
-            f"⏳ *Next Pending Registration*\n\n"
-            f"👤 Name: *{brother['full_name']}*\n"
-            f"📱 Phone: {brother.get('phone', '—')}\n\n"
-            f"_Skills and availability will be assigned after approval._\n\n"
-            f"📊 Remaining: {len(pending_approvals)}"
-        )
-        await callback.message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
-    else:
-        await state.clear()
-    
-    await callback.answer()
-
-# ── My Assignments ─────────────────────────────────────────────────────────────
 @router.message(Command("myassignments"))
 @router.message(F.text == "📅 My Assignments")
 async def cmd_my_assignments(message: Message):
-    today = date.today()
-    saturday = today + timedelta(days=(5 - today.weekday()) % 7)
-    text = (
-        f"📅 *Your Upcoming Assignments*\n\n"
-        f"🎤 *Microphone*\n"
-        f"📆 {saturday.strftime('%A, %B %d')} at 3:00 PM\n"
-        f"Status: ⏳ Pending confirmation"
-    )
-    await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=assign_kb("sample-id"))
+    uid = message.from_user.id
+    if not schedule_db:
+        await message.answer("📅 No schedule generated yet.", parse_mode=ParseMode.MARKDOWN); return
+    icons = {"stage":"🎭","microphone":"🎤","audio":"🔊","video":"🎥"}
+    my_sections = []
+    for section, ids in schedule_db["assignments"].items():
+        if uid in ids:
+            my_sections.append(f"{icons.get(section,'•')} *{section.capitalize()}*")
+    wl = schedule_db.get("week_label","This Week")
+    prog_date = schedule_db.get("program_date","")
+    if my_sections:
+        text = (f"📅 *Your Assignments — {wl}*\n\n"
+                + "\n".join(my_sections)
+                + f"\n\n🗓 {prog_date}  ⏰ 3:00 PM\nStatus: ⏳ Pending confirmation")
+        await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=assign_kb(f"{uid}"))
+    else:
+        await message.answer(f"📅 You have no assignments for {wl}.", parse_mode=ParseMode.MARKDOWN)
 
-# ── Availability ───────────────────────────────────────────────────────────────
 @router.message(Command("availability"))
 @router.message(F.text == "✅ Set Availability")
 async def cmd_availability(message: Message):
@@ -974,221 +940,197 @@ async def cmd_availability(message: Message):
         InlineKeyboardButton(text="✅ Available this Saturday", callback_data="avail_yes"),
         InlineKeyboardButton(text="❌ Not available",           callback_data="avail_no"),
     ]])
-    await message.answer(
-        "📅 *Availability Update*\n\nAre you available this coming Saturday?",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb,
-    )
+    await message.answer("📅 *Availability*\n\nAvailable this coming Saturday?",
+                         parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
 
-# ── Report ─────────────────────────────────────────────────────────────────────
 @router.message(Command("report"))
 @router.message(F.text == "📊 Report")
 async def cmd_report(message: Message):
     if not is_admin(message.from_user.id):
-        await message.answer("❌ This command is for admins only.")
-        return
-    today = date.today()
-    text = (
-        f"📊 *Monthly Report — {today.strftime('%B %Y')}*\n\n"
-        f"📅 Programs: *8*\n"
-        f"📝 Total Assignments: *40*\n"
-        f"⚖️ Fairness Score: *94%*\n\n"
-        f"*Top Servers:*\n"
-        f"🥇 Grace T. — 5 serves\n"
-        f"🥈 Ruth B. — 5 serves\n"
-        f"🥉 Elias K. — 4 serves\n\n"
-        f"*Needs More Rotation:*\n"
-        f"• Joseph A. — 2 serves\n"
-        f"• Solomon W. — 1 serve"
-    )
+        await message.answer("❌ Admin only."); return
+    from datetime import date as dt
+    today = dt.today()
+    if not brothers_db:
+        await message.answer(f"📊 *Report — {today.strftime('%B %Y')}*\n\nNo brothers yet.",
+                             parse_mode=ParseMode.MARKDOWN); return
+    sorted_b = sorted(brothers_db.values(), key=lambda x: x["serves"], reverse=True)
+    text = (f"📊 *Report — {today.strftime('%B %Y')}*\n\n"
+            f"👥 Brothers: *{len(brothers_db)}*\n"
+            f"📝 Total Serves: *{sum(b['serves'] for b in brothers_db.values())}*\n\n"
+            f"*Serve Count:*\n")
+    medals = ["🥇","🥈","🥉"]
+    for i, b in enumerate(sorted_b):
+        text += f"{medals[i] if i<3 else '•'} {b['full_name']} — {b['serves']} serves\n"
+    zero = [b for b in brothers_db.values() if b["serves"]==0]
+    if zero:
+        text += "\n*Not yet assigned:*\n" + "".join(f"• {b['full_name']}\n" for b in zero)
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
-# ── Send Reminders ─────────────────────────────────────────────────────────────
 @router.message(Command("sendreminders"))
 @router.message(F.text == "🔔 Send Reminders")
-async def cmd_send_reminders(message: Message):
+async def cmd_reminders(message: Message):
     if not is_admin(message.from_user.id):
-        await message.answer("❌ This command is for admins only.")
-        return
-    
-    if not bot_instance:
-        await message.answer("❌ Bot not ready. Try again in a moment.")
-        return
-    
-    today = date.today()
-    saturday = today + timedelta(days=(5 - today.weekday()) % 7)
-    
-    # Get assigned brothers
-    assigned = []
-    roles = {
-        'stage': assignments_db.get('stage'),
-        'microphone': assignments_db.get('microphone', []),
-        'audio': assignments_db.get('audio'),
-        'video': assignments_db.get('video'),
-    }
-    
-    reminder_text = (
-        f"🔔 *Service Reminder*\n\n"
-        f"📅 *Date*: {saturday.strftime('%A, %B %d, %Y')}\n"
-        f"⏰ *Time*: 3:00 PM\n\n"
-        f"You have been assigned a role in this week's service. "
-        f"Please confirm your attendance or let us know if you cannot make it.\n\n"
-        f"Use /myassignments to view your assignments."
-    )
-    
-    notified_count = 0
-    notified_names = []
-    
-    # Send reminders to assigned brothers
-    for role, brother_id in roles.items():
-        if brother_id and isinstance(brother_id, int) and brother_id in brothers_db:
-            brother_name = brothers_db[brother_id]['full_name']
-            if brother_id not in [n[0] for n in notified_names]:  # Avoid duplicates if assigned to multiple roles
+        await message.answer("❌ Admin only."); return
+    if not schedule_db:
+        await message.answer("⚠️ No schedule found. Use ⚡ Auto-Schedule first."); return
+    icons = {"stage":"🎭","microphone":"🎤","audio":"🔊","video":"🎥"}
+    wl = schedule_db.get("week_label","This Week")
+    prog_date = schedule_db.get("program_date","")
+    sent, failed = [], []
+    for section, ids in schedule_db["assignments"].items():
+        for tid in ids:
+            b = brothers_db.get(tid)
+            if not b: continue
+            label = f"{icons.get(section,'')} {section.capitalize()}"
+            if bot_instance and tid > 0:
                 try:
                     await bot_instance.send_message(
-                        brother_id,
-                        reminder_text,
-                        parse_mode=ParseMode.MARKDOWN,
-                    )
-                    notified_count += 1
-                    notified_names.append((brother_id, brother_name))
-                    logger.info(f"Reminder sent to {brother_name} ({brother_id}) for {role}")
+                        tid,
+                        f"⏰ *Reminder — {wl}!*\n\n"
+                        f"🗓 {prog_date}  ⏰ 3:00 PM\n"
+                        f"🎯 Your section: *{label}*\n\nSee you there! 🙏",
+                        parse_mode=ParseMode.MARKDOWN)
+                    sent.append(f"✅ {b['full_name']} ({label})")
                 except Exception as e:
-                    logger.error(f"Failed to send reminder to {brother_id}: {e}")
-        elif brother_id and isinstance(brother_id, list):  # For microphone list
-            for mic_id in brother_id:
-                if mic_id in brothers_db and mic_id not in [n[0] for n in notified_names]:
-                    brother_name = brothers_db[mic_id]['full_name']
-                    try:
-                        await bot_instance.send_message(
-                            mic_id,
-                            reminder_text,
-                            parse_mode=ParseMode.MARKDOWN,
-                        )
-                        notified_count += 1
-                        notified_names.append((mic_id, brother_name))
-                        logger.info(f"Reminder sent to {brother_name} ({mic_id}) for microphone")
-                    except Exception as e:
-                        logger.error(f"Failed to send reminder to {mic_id}: {e}")
-    
-    # Send confirmation to admin
-    if notified_names:
-        names_text = "\n".join([f"• {name} ({role.title()})" if role else f"• {name}" for _, name in notified_names for role, brother_id in roles.items() if isinstance(brother_id, int) and brother_id == _ or (isinstance(brother_id, list) and _ in brother_id)])
-        result_text = (
-            f"🔔 *Reminders Sent!*\n\n"
-            f"Program: Saturday {saturday.strftime('%B %d')} at 3:00 PM\n\n"
-            f"Notified ({notified_count}):\n"
-        )
-        for _, name in notified_names:
-            result_text += f"• {name}\n"
-    else:
-        result_text = f"⚠️ *No reminders sent* — No assignments for {saturday.strftime('%B %d')}"
-    
-    await message.answer(result_text, parse_mode=ParseMode.MARKDOWN)
+                    failed.append(f"⚠️ {b['full_name']} — failed")
+            else:
+                failed.append(f"⚠️ {b['full_name']} — not linked to bot yet")
+    lines = sent + failed
+    await message.answer(
+        f"🔔 *Reminders — {wl}*\n\n" + ("\n".join(lines) if lines else "_(no assignments)_"),
+        parse_mode=ParseMode.MARKDOWN)
 
-# ── Callbacks ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# CALLBACKS
+# ══════════════════════════════════════════════════════════════════════════════
 @router.callback_query(F.data == "approve_schedule")
-async def cb_approve(callback: CallbackQuery):
+async def cb_approve_schedule(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Admin only", show_alert=True)
-        return
+        await callback.answer("❌ Admin only", show_alert=True); return
+    schedule_db["approved"] = True
     await callback.message.edit_reply_markup(reply_markup=None)
+    # Notify all assigned brothers
+    icons = {"stage":"🎭","microphone":"🎤","audio":"🔊","video":"🎥"}
+    wl = schedule_db.get("week_label","This Week")
+    prog_date = schedule_db.get("program_date","")
+    notified = []
+    for section, ids in schedule_db["assignments"].items():
+        for tid in ids:
+            b = brothers_db.get(tid)
+            if b and bot_instance and tid > 0:
+                label = f"{icons.get(section,'')} {section.capitalize()}"
+                try:
+                    await bot_instance.send_message(
+                        tid,
+                        f"📢 *You have been assigned!*\n\n"
+                        f"📅 {wl}  🗓 {prog_date}  ⏰ 3:00 PM\n"
+                        f"🎯 Section: *{label}*\n\nPlease confirm:",
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=assign_kb(f"{tid}_{section}"))
+                    notified.append(b["full_name"])
+                    b["serves"] += 1
+                except Exception as e:
+                    logger.warning("Notify failed for %s: %s", tid, e)
     await callback.message.answer(
-        "✅ *Schedule Approved!*\n\nNotifications sent to all assigned brothers.",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=admin_menu(),
-    )
+        f"✅ *Schedule Approved!*\n\nNotified: {', '.join(notified) or '(none linked yet)'}",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=admin_menu())
     await callback.answer()
 
-@router.callback_query(F.data.startswith("save_"))
-async def cb_save(callback: CallbackQuery):
-    await callback.message.edit_reply_markup(reply_markup=None)
+@router.callback_query(F.data == "go_edit_schedule")
+async def cb_go_edit(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Admin only", show_alert=True); return
+    await state.set_state(EditScheduleFlow.choose_section)
     await callback.message.answer(
-        "💾 *Schedule Saved & Notifications Sent!*\n\n"
-        "Brothers notified:\n"
-        "• Michael A. (Stage)\n"
-        "• Grace T. (Microphone)\n"
-        "• Lydia H. (Microphone)\n"
-        "• Joseph A. (Audio)\n"
-        "• Mark L. (Video)",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=admin_menu(),
-    )
+        f"📝 *Edit Schedule — {schedule_db.get('week_label','This Week')}*\n\nChoose section:",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=sections_kb())
+    await callback.answer()
+
+@router.callback_query(F.data == "save_schedule")
+async def cb_save_schedule(callback: CallbackQuery):
+    if not schedule_db:
+        await callback.answer("No schedule to save.", show_alert=True); return
+    schedule_db["approved"] = True
+    icons = {"stage":"🎭","microphone":"🎤","audio":"🔊","video":"🎥"}
+    wl = schedule_db.get("week_label","This Week")
+    prog_date = schedule_db.get("program_date","")
+    notified, failed = [], []
+    for section, ids in schedule_db["assignments"].items():
+        for tid in ids:
+            b = brothers_db.get(tid)
+            if not b: continue
+            label = f"{icons.get(section,'')} {section.capitalize()}"
+            if bot_instance and tid > 0:
+                try:
+                    await bot_instance.send_message(
+                        tid,
+                        f"📢 *You have been assigned!*\n\n"
+                        f"📅 {wl}  🗓 {prog_date}  ⏰ 3:00 PM\n"
+                        f"🎯 Section: *{label}*\n\nPlease confirm:",
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=assign_kb(f"{tid}_{section}"))
+                    notified.append(f"✅ {b['full_name']} ({label})")
+                    b["serves"] += 1
+                except Exception as e:
+                    failed.append(f"⚠️ {b['full_name']} — delivery failed")
+            else:
+                failed.append(f"⚠️ {b['full_name']} — not linked yet")
+    await callback.message.edit_reply_markup(reply_markup=None)
+    lines = notified + failed
+    await callback.message.answer(
+        f"💾 *Schedule Saved!*\n\n" + ("\n".join(lines) if lines else "_(no brothers assigned)_"),
+        parse_mode=ParseMode.MARKDOWN, reply_markup=admin_menu())
     await callback.answer()
 
 @router.callback_query(F.data == "regen_schedule")
-async def cb_regen(callback: CallbackQuery):
-    await callback.answer("🔄 Regenerating... send /autoschedule again")
+async def cb_regen(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Admin only", show_alert=True); return
+    await callback.answer("🔄 Use ⚡ Auto-Schedule to regenerate.")
 
 @router.callback_query(F.data.startswith("confirm_"))
 async def cb_confirm(callback: CallbackQuery):
-    assignment_id = callback.data[8:]  # Extract assignment_id
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer(
-        "✅ *Confirmed!*\n\nThank you! See you at the program. We will send a reminder 24 hours before. 🙏",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    
-    # Notify admins about confirmation
+    await callback.message.answer("✅ *Confirmed!* See you at the program. 🙏",
+                                  parse_mode=ParseMode.MARKDOWN)
     if bot_instance:
-        try:
-            user_name = callback.from_user.first_name
-            confirm_msg = f"✅ *Assignment Confirmed*\n\n{user_name} has confirmed their assignment.\nAssignment ID: {assignment_id}"
-            await notify_all_admins(confirm_msg)
-        except Exception as e:
-            logger.error(f"Failed to notify admins of confirmation: {e}")
-    
+        name = callback.from_user.first_name
+        await notify_admins(bot_instance, f"✅ *{name}* confirmed their assignment.")
     await callback.answer("Confirmed ✅")
 
 @router.callback_query(F.data.startswith("decline_"))
 async def cb_decline(callback: CallbackQuery):
-    assignment_id = callback.data[8:]  # Extract assignment_id
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer(
-        "❌ *Noted.*\n\nYour absence has been recorded. Admin will arrange a replacement. Thank you for letting us know!",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    
-    # Notify admins about declination
+    await callback.message.answer("❌ *Noted.* Admin will arrange a replacement. Thank you!",
+                                  parse_mode=ParseMode.MARKDOWN)
     if bot_instance:
-        try:
-            user_name = callback.from_user.first_name
-            decline_msg = f"❌ *Assignment Declined*\n\n{user_name} cannot make the assignment.\nAssignment ID: {assignment_id}\n\nPlease arrange a replacement."
-            await notify_all_admins(decline_msg)
-        except Exception as e:
-            logger.error(f"Failed to notify admins of declination: {e}")
-    
+        name = callback.from_user.first_name
+        await notify_admins(bot_instance, f"❌ *{name}* declined their assignment. Please arrange a replacement.")
     await callback.answer()
 
 @router.callback_query(F.data.startswith("avail_"))
 async def cb_avail(callback: CallbackQuery):
-    is_available = callback.data == "avail_yes"
-    msg = "✅ *Marked available!* You are in the pool for this week." if is_available else \
-          "❌ *Marked unavailable.* Admin has been notified. Rest well! 🙏"
+    msg = ("✅ *Marked available!* You are in the pool." if callback.data=="avail_yes"
+           else "❌ *Marked unavailable.* Admin notified. 🙏")
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer(msg, parse_mode=ParseMode.MARKDOWN)
     await callback.answer()
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+@router.callback_query(F.data == "noop")
+async def cb_noop(callback: CallbackQuery):
+    await callback.answer()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
 async def main():
     global bot_instance
-    import ssl
-    import certifi
-    from aiohttp import TCPConnector
-    from aiogram.client.session.aiohttp import AiohttpSession
-
-    ssl_context = ssl.create_default_context(cafile=certifi.where())
-
-    connector = TCPConnector(ssl=ssl_context)
-    session = AiohttpSession()
-    session._connector = connector
-
-    bot = Bot(token=BOT_TOKEN, session=session)
-    bot_instance = bot  # Set global instance for notifications
+    bot = Bot(token=BOT_TOKEN)
+    bot_instance = bot
     dp  = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    logger.info("✅ AV Department Bot is starting...")
-    await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+    logger.info("✅ AV Department Bot v3 starting…")
+    await dp.start_polling(bot, allowed_updates=["message","callback_query"])
 
 if __name__ == "__main__":
     asyncio.run(main())
